@@ -1,0 +1,16 @@
+# macOS
+.DS_Store
+
+# OpenCode local deps/cache
+.opencode/node_modules/
+.opencode/package.json
+.opencode/bun.lock
+
+# Local runtime state (keep templates/plans, ignore live loop state)
+.agent-loop/boulder.json
+.agent-loop/loop-state.json
+.agent-loop/report-*.md
+.agent-loop/handoffs/*-handoff.md
+
+# Local scratch state
+.monkey-test-loop-state.json
