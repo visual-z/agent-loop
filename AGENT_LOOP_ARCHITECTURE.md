@@ -1,17 +1,22 @@
-# Agent Loop Architecture (OpenCode Only)
+# Agent Loop Architecture
 
 Version: 2.0  
 Date: 2026-03-30  
-Status: Implemented Baseline + Runtime Recycle
+Status: OpenCode baseline implemented + Claude Code equivalent migration
 
 ## Scope
 
-This document describes the implemented Agent Loop plugin in this repository.
+This document describes the implemented Agent Loop runtimes in this repository.
 
-- Platform: OpenCode only
+- Platforms:
+  - OpenCode plugin runtime (original)
+  - Claude Code plugin runtime (equivalent replacement)
 - Pattern: Orchestrator delegates all implementation to worker subagents
 - State root: `.agent-loop/`
 - Primary plugin: `.opencode/plugins/agent-loop/plugin.ts`
+- Claude plugin root: `claude-plugin/agent-loop/`
+
+Note: detailed sections below describe the OpenCode baseline architecture. Claude-specific runtime replacements are documented in `CLAUDE_AGENT_LOOP_MIGRATION.md`.
 
 ## Core Design
 
@@ -168,7 +173,7 @@ Gate module: `.opencode/plugins/agent-loop/gate.ts`
 
 ## Current Simplifications
 
-- No Claude Code compatibility layer in this repo
+- Claude runtime uses hooks + MCP tools instead of OpenCode event-injection APIs
 - No parallel worker execution (single-task sequential pipeline)
 - No automatic plan generation inside plugin tools (orchestrator creates plan file when needed)
 
@@ -188,3 +193,10 @@ Gate module: `.opencode/plugins/agent-loop/gate.ts`
 - `.opencode/plugins/agent-loop/gate.ts`
 - `.opencode/commands/agent-loop.md`
 - `.opencode/agents/agent-loop-orchestrator.md`
+- `claude-plugin/agent-loop/mcp/server.mjs`
+- `claude-plugin/agent-loop/mcp/core/state.mjs`
+- `claude-plugin/agent-loop/mcp/core/prompts.mjs`
+- `claude-plugin/agent-loop/mcp/core/gate.mjs`
+- `claude-plugin/agent-loop/hooks/hooks.json`
+- `claude-plugin/agent-loop/skills/agent-loop/SKILL.md`
+- `claude-plugin/agent-loop/agents/agent-loop-orchestrator.md`
