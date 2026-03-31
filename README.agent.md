@@ -16,14 +16,22 @@ Tell user to run inside OpenCode:
 
 Tell user to run:
 
+Step 1 - add the marketplace:
+
 ```bash
-/plugin add-marketplace https://github.com/visual-z/agent-loop
+/plugin marketplace add visual-z/agent-loop
 ```
 
 If your environment has shortcut syntax, this can be:
 
 ```bash
-/add-marketplace https://github.com/visual-z/agent-loop
+/plugin market add visual-z/agent-loop
+```
+
+Step 2 - install plugin:
+
+```bash
+/plugin install agent-loop@agent-loop
 ```
 
 ## 2) Invoke after install

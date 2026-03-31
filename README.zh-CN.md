@@ -16,16 +16,22 @@
 
 ### Claude Code
 
-**一步安装**（通过 marketplace）：
+**第 1 步** - 添加 marketplace（只需一次）：
 
 ```
-/plugin add-marketplace https://github.com/visual-z/agent-loop
+/plugin marketplace add visual-z/agent-loop
 ```
 
-如果你的环境支持快捷语法，也可以写成：
+支持简写则可写：
 
 ```
-/add-marketplace https://github.com/visual-z/agent-loop
+/plugin market add visual-z/agent-loop
+```
+
+**第 2 步** - 安装插件：
+
+```bash
+/plugin install agent-loop@agent-loop
 ```
 
 安装后执行 `/reload-plugins` 激活插件。

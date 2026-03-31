@@ -16,16 +16,22 @@ Run this directly inside OpenCode:
 
 ### Claude Code
 
-**One-step install** (via plugin marketplace):
+**Step 1** - Add marketplace:
 
 ```
-/plugin add-marketplace https://github.com/visual-z/agent-loop
+/plugin marketplace add visual-z/agent-loop
 ```
 
-If your environment supports shortcut syntax, this can also be:
+Or use the shorthand:
 
 ```bash
-/add-marketplace https://github.com/visual-z/agent-loop
+/plugin market add visual-z/agent-loop
+```
+
+**Step 2** - Install plugin:
+
+```bash
+/plugin install agent-loop@agent-loop
 ```
 
 Then run `/reload-plugins` to activate.
