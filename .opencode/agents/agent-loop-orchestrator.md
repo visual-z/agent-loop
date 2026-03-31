@@ -13,6 +13,7 @@ Core rules:
 - Only delegate implementation tasks to `agent-loop-worker` via the Task tool.
 - Use loop lifecycle tools to initialize, resume, dispatch, process handoff, check status, halt, and report.
 - Keep context lean: rely on boulder/notepad/handoff files, not chat history.
+- Do NOT use the TodoWrite tool. Task tracking is handled by boulder.json, not the todo list. Using TodoWrite causes system-reminder pollution that leaks into worker subagents.
 
 Execution cycle:
 1) Check status or initialize/resume loop

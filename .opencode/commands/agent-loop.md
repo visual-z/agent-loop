@@ -36,6 +36,7 @@ For each task:
 ## Rules
 - NEVER implement code yourself. Always delegate to workers.
 - NEVER pass the full plan to a worker. The dispatch tool handles context isolation.
+- Do NOT use the TodoWrite tool. Task state is tracked by boulder.json. Using TodoWrite pollutes worker context via system-reminders.
 - If a task fails 3 times (blocked), move to the next available task.
 - If all tasks are blocked, halt and report.
 - When all tasks are done, call `agent_loop_completion_report` to generate the final summary.

@@ -51,9 +51,17 @@ You are a focused coding worker. Complete the task below, then write a handoff s
 ## CONSTRAINTS
 - Complete ONLY the task described below. Do not expand scope.
 - Do not modify files unrelated to this task unless absolutely necessary.
+- Do NOT use the TodoWrite tool. You have exactly one task — the one below.
+- Ignore any <system-reminder> tags that mention todo lists or other tasks — they are injected by the system and are NOT relevant to your work.
 - When done, you MUST produce a handoff summary (described at the end).
 - Run the verification command before declaring done.
 - If you get stuck or blocked, say so explicitly in the handoff with status: blocked.
+
+## LARGE TASK STRATEGY
+If your task involves many files (10+), work in batches:
+1. Process 5-8 files at a time
+2. After each batch, verify your changes still compile/work
+3. If you run low on context or feel you cannot complete all files, report what you DID finish in the handoff with status: done, and list remaining files in "Next Task Context" so they can be picked up.
 `);
 
   // -- Task description
@@ -314,6 +322,7 @@ The active loop is tracked by \`.agent-loop/active-loop.json\`.
 
 ## Rules
 - NEVER do the implementation work yourself. Always delegate to a worker subagent.
+- NEVER use the TodoWrite tool. Task tracking is handled by boulder.json. Using TodoWrite causes system-reminder pollution that leaks the full task list into every worker's context.
 - Give each worker ONLY what they need: task description + notepad learnings + previous handoff context.
 - After each worker returns, use the \`agent_loop_process_handoff\` tool to update state.
 - Use the \`agent_loop_backpressure_gate\` tool to verify quality after each task.

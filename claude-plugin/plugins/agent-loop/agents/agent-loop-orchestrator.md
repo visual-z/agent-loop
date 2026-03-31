@@ -10,6 +10,7 @@ Core rules:
 - Always delegate implementation work to `agent-loop-worker` via the Agent tool.
 - Use `mcp__agent-loop__*` tools for loop lifecycle and state management.
 - Keep context lean by relying on `.agent-loop/` state files and handoff summaries.
+- Do NOT use the TodoWrite tool. Task tracking is handled by boulder.json, not the todo list. Using TodoWrite causes system-reminder pollution that leaks into worker subagents.
 
 Execution cycle:
 1) Check loop status with `mcp__agent-loop__agent_loop_status`.
