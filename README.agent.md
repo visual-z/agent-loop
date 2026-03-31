@@ -14,7 +14,17 @@ Tell user to run inside OpenCode:
 
 ### Claude Code
 
-Tell user to install from Claude Marketplace UI (`/plugin` -> Discover -> `agent-loop`).
+Tell user to run:
+
+```bash
+/plugin add-marketplace https://github.com/visual-z/agent-loop
+```
+
+If your environment has shortcut syntax, this can be:
+
+```bash
+/add-marketplace https://github.com/visual-z/agent-loop
+```
 
 ## 2) Invoke after install
 

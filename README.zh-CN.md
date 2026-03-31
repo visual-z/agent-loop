@@ -16,16 +16,16 @@
 
 ### Claude Code
 
-**第 1 步** - 添加 marketplace（只需一次）：
+**一步安装**（通过 marketplace）：
 
 ```
-/plugin marketplace add visual-z/agent-loop
+/plugin add-marketplace https://github.com/visual-z/agent-loop
 ```
 
-**第 2 步** - 安装插件：
+如果你的环境支持快捷语法，也可以写成：
 
 ```
-/plugin install agent-loop@agent-loop
+/add-marketplace https://github.com/visual-z/agent-loop
 ```
 
 安装后执行 `/reload-plugins` 激活插件。
