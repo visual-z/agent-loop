@@ -1,12 +1,21 @@
 // =============================================================================
-// Agent Loop Plugin — Main Entry Point
+// Agent Loop Plugin — Main Entry Point (Multi-Instance Isolated)
 // =============================================================================
 //
 // OpenCode plugin that orchestrates multi-step coding tasks through subagent
-// delegation with full context isolation (Strategy C from the plan).
+// delegation with full context isolation.
+//
+// ISOLATION MODEL:
+//   Each Agent Loop instance has a unique loop_id (= plan name) and its own
+//   directory under .agent-loop/loops/{loopId}/ containing boulder.json,
+//   loop-state.json, handoffs/, notepads/, and evidence/.
+//
+//   The plugin holds an activeLoopId in memory. All tools operate exclusively
+//   on the active loop. An active-loop.json pointer persists the active loop
+//   to disk for cross-session continuity.
 //
 // Architecture:
-//   User → /agent-loop → Orchestrator Agent → [Worker Subagent per task]
+//   User -> /agent-loop -> Orchestrator Agent -> [Worker Subagent per task]
 //   Plugin events drive auto-continuation between tasks.
 //
 // File: .opencode/plugins/agent-loop/plugin.ts
@@ -48,7 +57,13 @@ import {
   readNotepad,
   appendNotepad,
   loopDir,
+  loopInstanceDir,
   plansDir,
+  listLoops,
+  readActiveLoopPointer,
+  writeActiveLoopPointer,
+  clearActiveLoopPointer,
+  migrateOldLayout,
 } from "./state";
 
 import {
@@ -88,6 +103,9 @@ export const AgentLoopPlugin = async ({
   /** The orchestrator session ID, set when the loop starts */
   let orchestratorSessionId: string | null = null;
 
+  /** The currently active loop ID (= plan name) */
+  let activeLoopId: string | null = null;
+
   /** Whether we're actively in a loop iteration */
   let loopActive = false;
 
@@ -114,11 +132,61 @@ export const AgentLoopPlugin = async ({
 
   const WORKER_AGENT_NAMES = new Set(["agent-loop-worker"]);
 
-  async function ensureRuntimeState(sessionId: string | null): Promise<LoopRuntimeState> {
-    const existing = await readRuntimeState(workdir);
+  const isTerminalLoopStatus = (status: BoulderState["status"]) =>
+    status === "completed" || status === "halted" || status === "failed";
+
+  async function clearActiveLoopIfTerminal(
+    loopId: string | null,
+    status: BoulderState["status"]
+  ): Promise<void> {
+    if (!loopId || !isTerminalLoopStatus(status)) return;
+    await clearActiveLoopPointer(workdir);
+    if (activeLoopId === loopId) {
+      activeLoopId = null;
+      loopActive = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Startup: Auto-migration + restore active loop pointer
+  // ---------------------------------------------------------------------------
+
+  // Run migration check and restore active loop on startup
+  (async () => {
+    try {
+      // Migrate old single-instance layout if present
+      const migratedId = await migrateOldLayout(workdir);
+      if (migratedId) {
+        activeLoopId = migratedId;
+      }
+
+      // Restore from active-loop.json pointer
+      if (!activeLoopId) {
+        const pointer = await readActiveLoopPointer(workdir);
+        if (pointer) {
+          const state = await readBoulder(workdir, pointer.loop_id);
+          if (state && (state.status === "running" || state.status === "paused")) {
+            activeLoopId = pointer.loop_id;
+          }
+        }
+      }
+    } catch {
+      // Non-fatal — startup continues without active loop
+    }
+  })();
+
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
+
+  async function ensureRuntimeState(
+    loopId: string,
+    sessionId: string | null
+  ): Promise<LoopRuntimeState> {
+    const existing = await readRuntimeState(workdir, loopId);
     if (existing) return existing;
     const created = createRuntimeState(sessionId);
-    await writeRuntimeState(workdir, created);
+    await writeRuntimeState(workdir, loopId, created);
     return created;
   }
 
@@ -138,10 +206,6 @@ export const AgentLoopPlugin = async ({
   // Shell Runner Adapter
   // ---------------------------------------------------------------------------
 
-  /**
-   * Adapt the Bun $ shell to our expected interface.
-   * The plugin's $ is a tagged template literal; we wrap it for the gate.
-   */
   async function runShell(
     cmd: string[]
   ): Promise<{ exitCode: number; stdout: string; stderr: string }> {
@@ -194,15 +258,14 @@ export const AgentLoopPlugin = async ({
   // ---------------------------------------------------------------------------
 
   async function buildPayloadForTask(
+    loopId: string,
     state: BoulderState,
     task: PlanTask
   ): Promise<WorkerPayload> {
-    const planName = state.plan_name;
-
-    // Read notepad entries
-    const learnings = await readNotepad(workdir, planName, "learnings");
-    const decisions = await readNotepad(workdir, planName, "decisions");
-    const issues = await readNotepad(workdir, planName, "issues");
+    // Read notepad entries (now scoped to loopId, not planName)
+    const learnings = await readNotepad(workdir, loopId, "learnings");
+    const decisions = await readNotepad(workdir, loopId, "decisions");
+    const issues = await readNotepad(workdir, loopId, "issues");
 
     // Read previous handoff's "Next Task Context"
     let previousContext = "";
@@ -212,7 +275,7 @@ export const AgentLoopPlugin = async ({
 
     if (doneTasks.length > 0) {
       const lastDone = doneTasks[doneTasks.length - 1];
-      const handoff = await readHandoff(workdir, lastDone.task_key);
+      const handoff = await readHandoff(workdir, loopId, lastDone.task_key);
       if (handoff) {
         previousContext = handoff.next_task_context;
       }
@@ -251,20 +314,22 @@ export const AgentLoopPlugin = async ({
     // session.created — Reset per-session runtime counters
     // =========================================================================
     "session.created": async ({ event }: { event: any }) => {
-      const state = await readBoulder(workdir);
+      if (!activeLoopId) return;
+
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state || state.status !== "running") return;
 
       const incomingSessionId =
         event?.sessionID || event?.sessionId || event?.id || null;
 
-      const runtime = await ensureRuntimeState(incomingSessionId);
+      const runtime = await ensureRuntimeState(activeLoopId, incomingSessionId);
       runtime.active = true;
       runtime.pending_save_progress = false;
       runtime.iteration = 0;
       runtime.stall_count = 0;
       runtime.last_state_hash = null;
       runtime.session_id = incomingSessionId || runtime.session_id;
-      await writeRuntimeState(workdir, runtime);
+      await writeRuntimeState(workdir, activeLoopId, runtime);
 
       if (incomingSessionId) {
         orchestratorSessionId = incomingSessionId;
@@ -281,14 +346,23 @@ export const AgentLoopPlugin = async ({
       if (now - lastIdleTimestamp < IDLE_DEBOUNCE_MS) return;
       lastIdleTimestamp = now;
 
-      const state = await readBoulder(workdir);
+      if (!activeLoopId) return;
+
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state || state.status !== "running") {
         loopActive = false;
-        const runtime = await readRuntimeState(workdir);
+        const runtime = await readRuntimeState(workdir, activeLoopId);
         if (runtime?.active) {
           runtime.active = false;
           runtime.pending_save_progress = false;
-          await writeRuntimeState(workdir, runtime);
+          await writeRuntimeState(workdir, activeLoopId, runtime);
+        }
+
+        if (!state) {
+          await clearActiveLoopPointer(workdir);
+          activeLoopId = null;
+        } else {
+          await clearActiveLoopIfTerminal(activeLoopId, state.status);
         }
         return;
       }
@@ -296,6 +370,7 @@ export const AgentLoopPlugin = async ({
       const incomingSessionId =
         event?.sessionID || event?.sessionId || event?.id || null;
       const runtime = await ensureRuntimeState(
+        activeLoopId,
         orchestratorSessionId || incomingSessionId
       );
 
@@ -304,7 +379,7 @@ export const AgentLoopPlugin = async ({
       }
       if (!runtime.session_id && incomingSessionId) {
         runtime.session_id = incomingSessionId;
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
       }
 
       if (!loopActive && runtime.active) {
@@ -316,11 +391,10 @@ export const AgentLoopPlugin = async ({
       }
 
       // Check if there's a current task still in-progress (worker still running).
-      // Do this before stall detection so long-running workers do not trip stall protection.
       if (state.current_task) {
         const task = state.task_sessions[state.current_task];
         if (task?.status === "in-progress") {
-          const handoff = await readHandoff(workdir, state.current_task);
+          const handoff = await readHandoff(workdir, activeLoopId, state.current_task);
           if (!handoff) {
             return;
           }
@@ -338,7 +412,7 @@ export const AgentLoopPlugin = async ({
       if (runtime.stall_count >= runtime.stall_threshold) {
         runtime.active = false;
         loopActive = false;
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
         return;
       }
 
@@ -347,8 +421,9 @@ export const AgentLoopPlugin = async ({
         loopActive = false;
         runtime.active = false;
         runtime.pending_save_progress = false;
-        await writeBoulder(workdir, state);
-        await writeRuntimeState(workdir, runtime);
+        await writeBoulder(workdir, activeLoopId, state);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
+        await clearActiveLoopIfTerminal(activeLoopId, state.status);
         return;
       }
 
@@ -364,7 +439,7 @@ export const AgentLoopPlugin = async ({
         runtime.pending_save_progress = true;
         runtime.active = false;
         runtime.last_continued_at = new Date().toISOString();
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
 
         if (orchestratorSessionId || runtime.session_id) {
           const targetSessionId = orchestratorSessionId || runtime.session_id;
@@ -400,7 +475,7 @@ export const AgentLoopPlugin = async ({
       if (orchestratorSessionId || runtime.session_id) {
         const nextKey = pickNextTask(state);
         const nextSession = nextKey ? state.task_sessions[nextKey] : null;
-        const latestHandoff = await readLatestHandoff(workdir);
+        const latestHandoff = await readLatestHandoff(workdir, activeLoopId);
 
         const completedTaskKey =
           latestHandoff?.meta.task_key || state.current_task || "unknown";
@@ -416,7 +491,7 @@ export const AgentLoopPlugin = async ({
         const ctx: ContinuationContext = {
           completed_task_key: completedTaskKey,
           completed_task_title: completedTaskTitle,
-          handoff_summary: "", // Will be filled from handoff file
+          handoff_summary: "",
           gate_result: {
             passed: true,
             build: null,
@@ -430,13 +505,11 @@ export const AgentLoopPlugin = async ({
           progress: `${doneTasks.length}/${state.stats.total_tasks} tasks complete`,
         };
 
-        // Read latest handoff for summary
         if (latestHandoff) {
           ctx.handoff_summary = latestHandoff.what_was_done;
         }
 
         if (!nextKey) {
-          // All done or halted
           if (isLoopComplete(state)) {
             state.status = "completed";
           } else {
@@ -445,8 +518,9 @@ export const AgentLoopPlugin = async ({
           loopActive = false;
           runtime.active = false;
           runtime.pending_save_progress = false;
-          await writeBoulder(workdir, state);
-          await writeRuntimeState(workdir, runtime);
+          await writeBoulder(workdir, activeLoopId, state);
+          await writeRuntimeState(workdir, activeLoopId, runtime);
+          await clearActiveLoopIfTerminal(activeLoopId, state.status);
         }
 
         const prompt = buildContinuationPrompt(ctx);
@@ -454,11 +528,10 @@ export const AgentLoopPlugin = async ({
         if (!targetSessionId) {
           loopActive = false;
           runtime.active = false;
-          await writeRuntimeState(workdir, runtime);
+          await writeRuntimeState(workdir, activeLoopId, runtime);
           return;
         }
 
-        // Inject the continuation prompt into the orchestrator session
         try {
           await client.session.prompt({
             path: { id: targetSessionId },
@@ -474,13 +547,13 @@ export const AgentLoopPlugin = async ({
             runtime.total_iterations += 1;
             runtime.last_continued_at = new Date().toISOString();
             runtime.active = true;
-            await writeRuntimeState(workdir, runtime);
+            await writeRuntimeState(workdir, activeLoopId, runtime);
           }
         } catch (e: any) {
           console.error("[agent-loop] Failed to inject continuation:", e.message);
           loopActive = false;
           runtime.active = false;
-          await writeRuntimeState(workdir, runtime);
+          await writeRuntimeState(workdir, activeLoopId, runtime);
         }
       }
     },
@@ -489,10 +562,11 @@ export const AgentLoopPlugin = async ({
     // session.compacted — Preserve loop state across compaction
     // =========================================================================
     "experimental.session.compacting": async (input: any, output: any) => {
-      const state = await readBoulder(workdir);
+      if (!activeLoopId) return;
+
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state || state.status !== "running") return;
 
-      // Inject loop state context so the orchestrator remembers where it is
       const compactionCtx = buildCompactionContext(state);
       output.context.push(compactionCtx);
     },
@@ -501,31 +575,30 @@ export const AgentLoopPlugin = async ({
     // session.error — Handle session errors gracefully
     // =========================================================================
     "session.error": async ({ event }: { event: any }) => {
-      if (!loopActive) return;
+      if (!loopActive || !activeLoopId) return;
 
-      const state = await readBoulder(workdir);
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state) return;
-      const runtime = await readRuntimeState(workdir);
+      const runtime = await readRuntimeState(workdir, activeLoopId);
 
-      // If there's a current task, mark it as failed
       if (state.current_task) {
         markTaskFailed(
           state,
           state.current_task,
           `Session error: ${event?.error || "unknown error"}`
         );
-        await writeBoulder(workdir, state);
+        await writeBoulder(workdir, activeLoopId, state);
       }
 
-      // Check if we should halt
       if (shouldHalt(state)) {
         state.status = "halted";
         loopActive = false;
-        await writeBoulder(workdir, state);
+        await writeBoulder(workdir, activeLoopId, state);
+        await clearActiveLoopIfTerminal(activeLoopId, state.status);
         if (runtime) {
           runtime.active = false;
           runtime.pending_save_progress = false;
-          await writeRuntimeState(workdir, runtime);
+          await writeRuntimeState(workdir, activeLoopId, runtime);
         }
       }
     },
@@ -534,6 +607,8 @@ export const AgentLoopPlugin = async ({
     // tool.execute.before — Hard guardrails for orchestrator behavior
     // =========================================================================
     "tool.execute.before": async (input: any, output: any) => {
+      if (!activeLoopId) return;
+
       const toolName = input?.tool || input?.name;
       if (!toolName) return;
 
@@ -543,7 +618,7 @@ export const AgentLoopPlugin = async ({
         null;
       if (!sessionId) return;
 
-      const state = await readBoulder(workdir);
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state) return;
 
       if (
@@ -621,21 +696,12 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           args: { plan_path?: string; plan_name?: string; objective?: string },
           ctx: any
         ) {
-          // Check if loop is already active
-          const existing = await readBoulder(workdir);
-          if (existing && existing.status === "running") {
-            return JSON.stringify({
-              error: "Loop already active",
-              plan: existing.plan_name,
-              progress: `${existing.stats.done}/${existing.stats.total_tasks}`,
-              hint: "Use agent_loop_resume to continue, or manually set status to 'completed' in boulder.json to start fresh.",
-            });
-          }
+          // Run migration first if needed
+          await migrateOldLayout(workdir);
 
           let planPath: string;
 
           if (args.plan_path) {
-            // Use existing plan
             planPath = args.plan_path.startsWith("/")
               ? args.plan_path
               : join(workdir, args.plan_path);
@@ -646,8 +712,6 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
               });
             }
           } else if (args.plan_name && args.objective) {
-            // In a real implementation, this would dispatch a planner subagent
-            // For now, return instructions for the orchestrator to create the plan
             return JSON.stringify({
               action: "create_plan",
               plan_name: args.plan_name,
@@ -669,25 +733,45 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             });
           }
 
+          const loopId = plan.name;
+
+          // Check if a loop with this ID already exists and is running
+          const existing = await readBoulder(workdir, loopId);
+          if (existing && existing.status === "running") {
+            return JSON.stringify({
+              error: "Loop already active",
+              loop_id: loopId,
+              plan: existing.plan_name,
+              progress: `${existing.stats.done}/${existing.stats.total_tasks}`,
+              hint: "Use agent_loop_resume to continue, or agent_loop_halt to stop it first.",
+            });
+          }
+
           // Set the orchestrator session ID from the calling context
           orchestratorSessionId = ctx?.sessionId || null;
 
-          // Create boulder state
+          // Create boulder state with loop_id
           const state = createBoulder(
+            loopId,
             planPath,
             plan.name,
             plan.tasks,
             orchestratorSessionId
           );
-          await writeBoulder(workdir, state);
+          await writeBoulder(workdir, loopId, state);
 
           // Activate the loop
+          activeLoopId = loopId;
           loopActive = true;
           const runtime = createRuntimeState(orchestratorSessionId, state.started_at);
-          await writeRuntimeState(workdir, runtime);
+          await writeRuntimeState(workdir, loopId, runtime);
+
+          // Write the active loop pointer
+          await writeActiveLoopPointer(workdir, loopId);
 
           return JSON.stringify({
             status: "initialized",
+            loop_id: loopId,
             plan_name: plan.name,
             total_tasks: plan.tasks.length,
             tasks: plan.tasks.map((t) => ({
@@ -701,37 +785,104 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       },
 
       // -------------------------------------------------------------------
-      // agent_loop_resume — Resume an existing loop
+      // agent_loop_resume — Resume an existing loop (with loop selection)
       // -------------------------------------------------------------------
       agent_loop_resume: {
         description:
           "Resume an existing Agent Loop from boulder.json. Use this when re-entering a session with an active loop.",
         parameters: {
           type: "object" as const,
-          properties: {},
+          properties: {
+            loop_id: {
+              type: "string",
+              description:
+                "The loop ID to resume. If omitted: auto-resumes the only resumable loop, or returns a list to choose from.",
+            },
+          },
         },
-        async execute(_args: {}, ctx: any) {
-          const state = await readBoulder(workdir);
+        async execute(args: { loop_id?: string }, ctx: any) {
+          // Run migration first if needed
+          await migrateOldLayout(workdir);
+
+          let targetLoopId = args.loop_id;
+
+          if (!targetLoopId) {
+            // Discover available loops
+            const loops = await listLoops(workdir);
+            const resumable = loops.filter(
+              (l) =>
+                l.status === "running" ||
+                l.status === "paused" ||
+                l.status === "planning"
+            );
+
+            if (resumable.length === 0) {
+              // Check if there are any loops at all
+              if (loops.length === 0) {
+                return JSON.stringify({
+                  error: "No Agent Loop instances found. Use agent_loop_init to start a new one.",
+                });
+              }
+              return JSON.stringify({
+                error: "No resumable loops found. All loops are completed/halted/failed.",
+                all_loops: loops.map((l) => ({
+                  loop_id: l.loop_id,
+                  status: l.status,
+                  progress: l.progress,
+                  updated_at: l.updated_at,
+                })),
+                hint: "Use agent_loop_init to start a new loop.",
+              });
+            }
+
+            if (resumable.length === 1) {
+              // Auto-select the only resumable loop
+              targetLoopId = resumable[0].loop_id;
+            } else {
+              // Multiple resumable loops — return list for user to pick
+              return JSON.stringify({
+                action: "select_loop",
+                message:
+                  "Multiple resumable Agent Loops found. Please specify which one to resume by calling agent_loop_resume with loop_id.",
+                resumable_loops: resumable.map((l) => ({
+                  loop_id: l.loop_id,
+                  plan_name: l.plan_name,
+                  status: l.status,
+                  progress: l.progress,
+                  started_at: l.started_at,
+                  updated_at: l.updated_at,
+                })),
+              });
+            }
+          }
+
+          const state = await readBoulder(workdir, targetLoopId);
           if (!state) {
             return JSON.stringify({
-              error: "No boulder.json found. Use agent_loop_init to start a new loop.",
+              error: `No boulder.json found for loop "${targetLoopId}". Use agent_loop_init to start a new loop.`,
+              available_loops: (await listLoops(workdir)).map((l) => l.loop_id),
             });
           }
 
           if (state.status === "completed") {
             return JSON.stringify({
               status: "completed",
+              loop_id: targetLoopId,
               plan: state.plan_name,
               message: "This loop is already completed.",
             });
           }
 
           // Update orchestrator session
-          const runtime = await ensureRuntimeState(ctx?.sessionId || null);
-          orchestratorSessionId = ctx?.sessionId || runtime.session_id || state.orchestrator_session_id;
+          const runtime = await ensureRuntimeState(
+            targetLoopId,
+            ctx?.sessionId || null
+          );
+          orchestratorSessionId =
+            ctx?.sessionId || runtime.session_id || state.orchestrator_session_id;
           state.orchestrator_session_id = orchestratorSessionId;
           state.status = "running";
-          await writeBoulder(workdir, state);
+          await writeBoulder(workdir, targetLoopId, state);
 
           runtime.active = true;
           runtime.session_id = orchestratorSessionId || runtime.session_id;
@@ -739,16 +890,20 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           runtime.iteration = 0;
           runtime.stall_count = 0;
           runtime.last_state_hash = null;
-          await writeRuntimeState(workdir, runtime);
+          await writeRuntimeState(workdir, targetLoopId, runtime);
 
+          // Activate this loop
+          activeLoopId = targetLoopId;
           loopActive = true;
+          await writeActiveLoopPointer(workdir, targetLoopId);
 
           // Find next task
           const nextKey = pickNextTask(state);
-          const latestHandoff = await readLatestHandoff(workdir);
+          const latestHandoff = await readLatestHandoff(workdir, targetLoopId);
 
           return JSON.stringify({
             status: "resumed",
+            loop_id: targetLoopId,
             plan: state.plan_name,
             iteration: state.iteration,
             progress: `${state.stats.done}/${state.stats.total_tasks}`,
@@ -784,12 +939,20 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           required: ["task_key"],
         },
         async execute(args: { task_key: string }, ctx: any) {
-          const state = await readBoulder(workdir);
-          if (!state) {
-            return JSON.stringify({ error: "No active loop. Call agent_loop_init first." });
+          if (!activeLoopId) {
+            return JSON.stringify({
+              error: "No active loop. Call agent_loop_init or agent_loop_resume first.",
+            });
           }
 
-          const runtime = await readRuntimeState(workdir);
+          const state = await readBoulder(workdir, activeLoopId);
+          if (!state) {
+            return JSON.stringify({
+              error: "No active loop state. Call agent_loop_init first.",
+            });
+          }
+
+          const runtime = await readRuntimeState(workdir, activeLoopId);
           if (runtime?.pending_save_progress) {
             return JSON.stringify({
               error: "Session recycle required before dispatching more workers.",
@@ -851,12 +1014,12 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           }
 
           // Build the worker payload
-          const payload = await buildPayloadForTask(state, task);
+          const payload = await buildPayloadForTask(activeLoopId, state, task);
           const workerPrompt = buildWorkerPrompt(payload);
 
           // Mark task as started
           markTaskStarted(state, args.task_key);
-          await writeBoulder(workdir, state);
+          await writeBoulder(workdir, activeLoopId, state);
 
           return JSON.stringify({
             action: "dispatch",
@@ -902,7 +1065,11 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           },
           _ctx: any
         ) {
-          const state = await readBoulder(workdir);
+          if (!activeLoopId) {
+            return JSON.stringify({ error: "No active loop." });
+          }
+
+          const state = await readBoulder(workdir, activeLoopId);
           if (!state) {
             return JSON.stringify({ error: "No active loop." });
           }
@@ -933,13 +1100,12 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           const parsed = parseHandoffFromWorkerOutput(args.worker_output);
 
           if (!parsed) {
-            // Worker didn't produce a proper handoff — treat as failed
             markTaskFailed(
               state,
               args.task_key,
               "Worker did not produce a HANDOFF_START...HANDOFF_END block."
             );
-            await writeBoulder(workdir, state);
+            await writeBoulder(workdir, activeLoopId, state);
 
             return JSON.stringify({
               status: "failed",
@@ -974,7 +1140,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             .filter(Boolean)
             .join("\n");
 
-          // Write the handoff file
+          // Write the handoff file (scoped to this loop)
           const handoffFile: HandoffFile = {
             meta: {
               task_key: args.task_key,
@@ -985,13 +1151,13 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             },
             ...parsed,
           };
-          await writeHandoff(workdir, handoffFile);
+          await writeHandoff(workdir, activeLoopId, handoffFile);
 
-          // Append learnings to notepad
+          // Append learnings to notepad (scoped to this loop)
           if (parsed.learnings && parsed.learnings.trim()) {
             await appendNotepad(
               workdir,
-              state.plan_name,
+              activeLoopId,
               "learnings",
               `From ${args.task_key} (${taskSession.task_title}):\n${parsed.learnings}`
             );
@@ -999,7 +1165,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           if (parsed.key_decisions && parsed.key_decisions.trim()) {
             await appendNotepad(
               workdir,
-              state.plan_name,
+              activeLoopId,
               "decisions",
               `From ${args.task_key}:\n${parsed.key_decisions}`
             );
@@ -1007,7 +1173,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           if (parsed.blocked_issues && parsed.blocked_issues.trim() && parsed.blocked_issues !== "None") {
             await appendNotepad(
               workdir,
-              state.plan_name,
+              activeLoopId,
               "issues",
               `From ${args.task_key}:\n${parsed.blocked_issues}`
             );
@@ -1020,7 +1186,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
               args.task_key,
               parsed.blocked_issues || "Worker reported blocked status"
             );
-            await writeBoulder(workdir, state);
+            await writeBoulder(workdir, activeLoopId, state);
 
             const nextKey = pickNextTask(state);
             return JSON.stringify({
@@ -1045,7 +1211,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
               args.task_key,
               parsed.blocked_issues || "Worker reported failure"
             );
-            await writeBoulder(workdir, state);
+            await writeBoulder(workdir, activeLoopId, state);
 
             const nextKey = pickNextTask(state);
             return JSON.stringify({
@@ -1089,14 +1255,12 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           }
 
           if (gateResult.passed) {
-            // Task completed successfully
             markTaskDone(state, args.task_key);
             state.stats.backpressure_failures = Math.max(
               0,
               (state.stats.backpressure_failures || 0)
             );
           } else {
-            // Gate failed — mark task as failed for retry
             state.stats.backpressure_failures =
               (state.stats.backpressure_failures || 0) + 1;
             markTaskFailed(
@@ -1106,12 +1270,28 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             );
           }
 
-          await writeBoulder(workdir, state);
-
-          // Determine next action
           const nextKey = pickNextTask(state);
           const allDone = isLoopComplete(state);
           const halted = shouldHalt(state);
+
+          if (allDone) {
+            state.status = "completed";
+          } else if (halted) {
+            state.status = "halted";
+          }
+
+          await writeBoulder(workdir, activeLoopId, state);
+
+          if (isTerminalLoopStatus(state.status)) {
+            loopActive = false;
+            const runtime = await readRuntimeState(workdir, activeLoopId);
+            if (runtime) {
+              runtime.active = false;
+              runtime.pending_save_progress = false;
+              await writeRuntimeState(workdir, activeLoopId, runtime);
+            }
+            await clearActiveLoopIfTerminal(activeLoopId, state.status);
+          }
 
           const doneTasks = Object.values(state.task_sessions).filter(
             (t) => t.status === "done"
@@ -1169,22 +1349,60 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           "Get the current status of the Agent Loop: progress, task states, latest handoff.",
         parameters: {
           type: "object" as const,
-          properties: {},
+          properties: {
+            loop_id: {
+              type: "string",
+              description:
+                "Specific loop ID to check. Omit to see the active loop and list all loops.",
+            },
+          },
         },
-        async execute() {
-          const state = await readBoulder(workdir);
-          const runtime = await readRuntimeState(workdir);
-          if (!state) {
+        async execute(args: { loop_id?: string }) {
+          // Run migration first if needed
+          await migrateOldLayout(workdir);
+
+          const targetLoopId = args.loop_id || activeLoopId;
+
+          // If no specific loop requested and no active loop, list all
+          if (!targetLoopId) {
+            const loops = await listLoops(workdir);
             return JSON.stringify({
               active: false,
-              message: "No active Agent Loop. Use agent_loop_init to start one.",
+              active_loop_id: null,
+              message: loops.length === 0
+                ? "No Agent Loop instances found. Use agent_loop_init to start one."
+                : "No active loop in this session. Use agent_loop_resume to continue one.",
+              all_loops: loops.map((l) => ({
+                loop_id: l.loop_id,
+                plan_name: l.plan_name,
+                status: l.status,
+                progress: l.progress,
+                started_at: l.started_at,
+                updated_at: l.updated_at,
+              })),
             });
           }
 
-          const latestHandoff = await readLatestHandoff(workdir);
+          const state = await readBoulder(workdir, targetLoopId);
+          const runtime = await readRuntimeState(workdir, targetLoopId);
+          if (!state) {
+            return JSON.stringify({
+              active: false,
+              loop_id: targetLoopId,
+              message: `Loop "${targetLoopId}" not found.`,
+              available_loops: (await listLoops(workdir)).map((l) => l.loop_id),
+            });
+          }
+
+          const latestHandoff = await readLatestHandoff(workdir, targetLoopId);
+
+          // Also list all loops for context
+          const allLoops = await listLoops(workdir);
 
           return JSON.stringify({
             active: state.status === "running",
+            loop_id: targetLoopId,
+            is_current: targetLoopId === activeLoopId,
             plan: state.plan_name,
             status: state.status,
             iteration: state.iteration,
@@ -1222,6 +1440,13 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
                   summary: latestHandoff.what_was_done.slice(0, 200),
                 }
               : null,
+            all_loops: allLoops.length > 1
+              ? allLoops.map((l) => ({
+                  loop_id: l.loop_id,
+                  status: l.status,
+                  progress: l.progress,
+                }))
+              : undefined,
           });
         },
       },
@@ -1242,31 +1467,39 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           },
         },
         async execute(args: { reason?: string }) {
-          const state = await readBoulder(workdir);
+          if (!activeLoopId) {
+            return JSON.stringify({ error: "No active loop." });
+          }
+
+          const state = await readBoulder(workdir, activeLoopId);
           if (!state) {
             return JSON.stringify({ error: "No active loop." });
           }
 
-          const runtime = await readRuntimeState(workdir);
+          const runtime = await readRuntimeState(workdir, activeLoopId);
 
           state.status = "paused";
           if (state.current_task) {
             const t = state.task_sessions[state.current_task];
             if (t && t.status === "in-progress") {
-              t.status = "pending"; // Reset to pending so it can be resumed
+              t.status = "pending";
             }
             state.current_task = null;
           }
-          await writeBoulder(workdir, state);
+          await writeBoulder(workdir, activeLoopId, state);
           loopActive = false;
           if (runtime) {
             runtime.active = false;
             runtime.pending_save_progress = false;
-            await writeRuntimeState(workdir, runtime);
+            await writeRuntimeState(workdir, activeLoopId, runtime);
           }
+
+          // Clear active loop pointer
+          await clearActiveLoopPointer(workdir);
 
           return JSON.stringify({
             status: "paused",
+            loop_id: activeLoopId,
             reason: args.reason || "Manual halt",
             progress: `${state.stats.done}/${state.stats.total_tasks}`,
             message:
@@ -1316,23 +1549,22 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           type: "learnings" | "decisions" | "issues";
           content: string;
         }) {
-          const state = await readBoulder(workdir);
-          if (!state) {
+          if (!activeLoopId) {
             return JSON.stringify({
-              error: "No active loop — notepad needs a plan context.",
+              error: "No active loop — notepad needs a loop context.",
             });
           }
 
           await appendNotepad(
             workdir,
-            state.plan_name,
+            activeLoopId,
             args.type,
             args.content
           );
           return JSON.stringify({
             status: "appended",
             notepad: args.type,
-            plan: state.plan_name,
+            loop_id: activeLoopId,
           });
         },
       },
@@ -1348,26 +1580,18 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           properties: {},
         },
         async execute() {
-          const state = await readBoulder(workdir);
+          if (!activeLoopId) {
+            return JSON.stringify({ error: "No active loop." });
+          }
+
+          const state = await readBoulder(workdir, activeLoopId);
           if (!state) {
             return JSON.stringify({ error: "No loop state found." });
           }
 
-          const learnings = await readNotepad(
-            workdir,
-            state.plan_name,
-            "learnings"
-          );
-          const decisions = await readNotepad(
-            workdir,
-            state.plan_name,
-            "decisions"
-          );
-          const issues = await readNotepad(
-            workdir,
-            state.plan_name,
-            "issues"
-          );
+          const learnings = await readNotepad(workdir, activeLoopId, "learnings");
+          const decisions = await readNotepad(workdir, activeLoopId, "decisions");
+          const issues = await readNotepad(workdir, activeLoopId, "issues");
 
           const tasks = Object.values(state.task_sessions);
           const done = tasks.filter((t) => t.status === "done");
@@ -1377,6 +1601,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           const report = [
             `# Agent Loop Completion Report`,
             ``,
+            `**Loop ID**: ${activeLoopId}`,
             `**Plan**: ${state.plan_name}`,
             `**Started**: ${state.started_at}`,
             `**Completed**: ${state.updated_at}`,
@@ -1386,10 +1611,10 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             `## Results: ${done.length}/${tasks.length} tasks completed`,
             ``,
             ...done.map(
-              (t) => `- ✅ ${t.task_key}: ${t.task_title} (${t.attempts} attempt${t.attempts > 1 ? "s" : ""})`
+              (t) => `- [done] ${t.task_key}: ${t.task_title} (${t.attempts} attempt${t.attempts > 1 ? "s" : ""})`
             ),
             ...blocked.map(
-              (t) => `- 🚫 ${t.task_key}: ${t.task_title} — BLOCKED: ${t.last_error?.slice(0, 100) || "unknown"}`
+              (t) => `- [blocked] ${t.task_key}: ${t.task_title} — ${t.last_error?.slice(0, 100) || "unknown"}`
             ),
             ``,
             learnings
@@ -1405,9 +1630,9 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             .filter(Boolean)
             .join("\n");
 
-          // Write report to file
+          // Write report to loop-specific directory
           const reportPath = join(
-            loopDir(workdir),
+            loopInstanceDir(workdir, activeLoopId),
             `report-${state.plan_name}.md`
           );
           await writeFile(reportPath, report, "utf-8");

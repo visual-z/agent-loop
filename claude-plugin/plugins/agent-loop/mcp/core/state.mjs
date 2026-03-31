@@ -1,30 +1,269 @@
-import { readFile, writeFile, mkdir, readdir } from "fs/promises";
+// =============================================================================
+// Agent Loop — State Management (multi-instance isolated)
+// =============================================================================
+//
+// Each Agent Loop instance gets its own directory under .agent-loop/loops/{loopId}/
+// containing boulder.json, loop-state.json, handoffs/, notepads/, and evidence/.
+//
+// Plans remain shared under .agent-loop/plans/.
+// An active-loop.json pointer tracks the currently active loop on disk.
+// =============================================================================
+
+import { readFile, writeFile, mkdir, readdir, rename, unlink } from "fs/promises";
 import { existsSync } from "fs";
 import { join, basename } from "path";
 
+// ---------------------------------------------------------------------------
+// Paths — Global (shared across all loops)
+// ---------------------------------------------------------------------------
+
+/** Top-level .agent-loop directory */
 export function loopDir(workdir) {
   return join(workdir, ".agent-loop");
 }
 
-export function boulderPath(workdir) {
-  return join(loopDir(workdir), "boulder.json");
-}
-
+/** Shared plans directory */
 export function plansDir(workdir) {
   return join(loopDir(workdir), "plans");
 }
 
-export function handoffsDir(workdir) {
-  return join(loopDir(workdir), "handoffs");
+/** Root of all loop instances */
+export function loopsRoot(workdir) {
+  return join(loopDir(workdir), "loops");
 }
 
-export function notepadsDir(workdir, planName) {
-  return join(loopDir(workdir), "notepads", planName);
+/** Path to the active-loop pointer file */
+export function activeLoopPointerPath(workdir) {
+  return join(loopDir(workdir), "active-loop.json");
 }
 
-export function runtimeStatePath(workdir) {
-  return join(loopDir(workdir), "loop-state.json");
+// ---------------------------------------------------------------------------
+// Paths — Per-loop instance
+// ---------------------------------------------------------------------------
+
+/** Directory for a specific loop instance */
+export function loopInstanceDir(workdir, loopId) {
+  return join(loopsRoot(workdir), loopId);
 }
+
+export function boulderPath(workdir, loopId) {
+  return join(loopInstanceDir(workdir, loopId), "boulder.json");
+}
+
+export function handoffsDir(workdir, loopId) {
+  return join(loopInstanceDir(workdir, loopId), "handoffs");
+}
+
+export function notepadsDir(workdir, loopId) {
+  return join(loopInstanceDir(workdir, loopId), "notepads");
+}
+
+export function evidenceDir(workdir, loopId) {
+  return join(loopInstanceDir(workdir, loopId), "evidence");
+}
+
+export function runtimeStatePath(workdir, loopId) {
+  return join(loopInstanceDir(workdir, loopId), "loop-state.json");
+}
+
+// ---------------------------------------------------------------------------
+// Active Loop Pointer — Tracks which loop is currently active
+// ---------------------------------------------------------------------------
+
+export async function readActiveLoopPointer(workdir) {
+  const p = activeLoopPointerPath(workdir);
+  if (!existsSync(p)) return null;
+  try {
+    const raw = await readFile(p, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+export async function writeActiveLoopPointer(workdir, loopId) {
+  await ensureDir(loopDir(workdir));
+  const pointer = {
+    loop_id: loopId,
+    activated_at: new Date().toISOString(),
+  };
+  await writeFile(
+    activeLoopPointerPath(workdir),
+    JSON.stringify(pointer, null, 2),
+    "utf-8"
+  );
+}
+
+export async function clearActiveLoopPointer(workdir) {
+  const p = activeLoopPointerPath(workdir);
+  if (existsSync(p)) {
+    try {
+      await unlink(p);
+    } catch {
+      // best effort
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// List Loops — Discover all loop instances
+// ---------------------------------------------------------------------------
+
+export async function listLoops(workdir) {
+  const root = loopsRoot(workdir);
+  if (!existsSync(root)) return [];
+
+  const entries = await readdir(root, { withFileTypes: true });
+  const loops = [];
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const loopId = entry.name;
+    const boulder = await readBoulder(workdir, loopId);
+    if (!boulder) continue;
+
+    loops.push({
+      loop_id: loopId,
+      plan_name: boulder.plan_name,
+      status: boulder.status,
+      progress: `${boulder.stats.done}/${boulder.stats.total_tasks}`,
+      started_at: boulder.started_at,
+      updated_at: boulder.updated_at,
+    });
+  }
+
+  // Sort by updated_at descending (most recent first)
+  loops.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  return loops;
+}
+
+// ---------------------------------------------------------------------------
+// Migration — Move old single-instance layout to new multi-instance layout
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect and migrate old-style .agent-loop/boulder.json to
+ * .agent-loop/loops/{planName}/boulder.json.
+ *
+ * Returns the migrated loop_id, or null if no migration was needed.
+ */
+export async function migrateOldLayout(workdir) {
+  const oldBoulderPath = join(loopDir(workdir), "boulder.json");
+  if (!existsSync(oldBoulderPath)) return null;
+
+  let oldBoulder;
+  try {
+    const raw = await readFile(oldBoulderPath, "utf-8");
+    oldBoulder = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+
+  const loopId = oldBoulder.plan_name || "default";
+  const instanceDir = loopInstanceDir(workdir, loopId);
+
+  // Don't migrate if target already exists
+  if (existsSync(join(instanceDir, "boulder.json"))) {
+    try { await unlink(oldBoulderPath); } catch { /* ignore */ }
+    return loopId;
+  }
+
+  // Create the new loop directory
+  await ensureDir(instanceDir);
+
+  // Migrate boulder.json
+  oldBoulder.loop_id = loopId;
+  await writeFile(
+    join(instanceDir, "boulder.json"),
+    JSON.stringify(oldBoulder, null, 2),
+    "utf-8"
+  );
+
+  // Migrate loop-state.json
+  const oldRuntimePath = join(loopDir(workdir), "loop-state.json");
+  if (existsSync(oldRuntimePath)) {
+    try {
+      await rename(oldRuntimePath, join(instanceDir, "loop-state.json"));
+    } catch {
+      const content = await readFile(oldRuntimePath, "utf-8");
+      await writeFile(join(instanceDir, "loop-state.json"), content, "utf-8");
+      try { await unlink(oldRuntimePath); } catch { /* ignore */ }
+    }
+  }
+
+  // Migrate handoffs
+  const oldHandoffsDir = join(loopDir(workdir), "handoffs");
+  if (existsSync(oldHandoffsDir)) {
+    const newHandoffsDir = join(instanceDir, "handoffs");
+    await ensureDir(newHandoffsDir);
+    const files = await readdir(oldHandoffsDir);
+    for (const file of files) {
+      if (file.endsWith("-handoff.md")) {
+        try {
+          await rename(join(oldHandoffsDir, file), join(newHandoffsDir, file));
+        } catch {
+          const content = await readFile(join(oldHandoffsDir, file), "utf-8");
+          await writeFile(join(newHandoffsDir, file), content, "utf-8");
+        }
+      }
+    }
+  }
+
+  // Migrate notepads (old structure: .agent-loop/notepads/{planName}/)
+  const oldNotepadsDir = join(loopDir(workdir), "notepads", loopId);
+  if (existsSync(oldNotepadsDir)) {
+    const newNotepadsDir = join(instanceDir, "notepads");
+    await ensureDir(newNotepadsDir);
+    const files = await readdir(oldNotepadsDir);
+    for (const file of files) {
+      try {
+        await rename(join(oldNotepadsDir, file), join(newNotepadsDir, file));
+      } catch {
+        const content = await readFile(join(oldNotepadsDir, file), "utf-8");
+        await writeFile(join(newNotepadsDir, file), content, "utf-8");
+      }
+    }
+  }
+
+  // Migrate evidence
+  const oldEvidenceDir = join(loopDir(workdir), "evidence");
+  if (existsSync(oldEvidenceDir)) {
+    const newEvidenceDir = join(instanceDir, "evidence");
+    await ensureDir(newEvidenceDir);
+    const files = await readdir(oldEvidenceDir);
+    for (const file of files) {
+      if (file === ".gitkeep") continue;
+      try {
+        await rename(join(oldEvidenceDir, file), join(newEvidenceDir, file));
+      } catch {
+        const content = await readFile(join(oldEvidenceDir, file), "utf-8");
+        await writeFile(join(newEvidenceDir, file), content, "utf-8");
+      }
+    }
+  }
+
+  // Migrate report if exists
+  const oldReportPath = join(loopDir(workdir), `report-${loopId}.md`);
+  if (existsSync(oldReportPath)) {
+    try {
+      await rename(oldReportPath, join(instanceDir, `report-${loopId}.md`));
+    } catch { /* ignore */ }
+  }
+
+  // Remove old boulder.json
+  try { await unlink(oldBoulderPath); } catch { /* ignore */ }
+
+  // Set as active if it was running
+  if (oldBoulder.status === "running" || oldBoulder.status === "paused") {
+    await writeActiveLoopPointer(workdir, loopId);
+  }
+
+  return loopId;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime State (loop-state.json) — Per-loop instance
+// ---------------------------------------------------------------------------
 
 export function createRuntimeState(sessionId, startedAt) {
   const now = startedAt || new Date().toISOString();
@@ -45,8 +284,8 @@ export function createRuntimeState(sessionId, startedAt) {
   };
 }
 
-export async function readRuntimeState(workdir) {
-  const p = runtimeStatePath(workdir);
+export async function readRuntimeState(workdir, loopId) {
+  const p = runtimeStatePath(workdir, loopId);
   if (!existsSync(p)) return null;
   try {
     const raw = await readFile(p, "utf-8");
@@ -65,13 +304,21 @@ export async function readRuntimeState(workdir) {
   }
 }
 
-export async function writeRuntimeState(workdir, state) {
-  await ensureDir(loopDir(workdir));
-  await writeFile(runtimeStatePath(workdir), JSON.stringify(state, null, 2), "utf-8");
+export async function writeRuntimeState(workdir, loopId, state) {
+  await ensureDir(loopInstanceDir(workdir, loopId));
+  await writeFile(
+    runtimeStatePath(workdir, loopId),
+    JSON.stringify(state, null, 2),
+    "utf-8"
+  );
 }
 
-export async function readBoulder(workdir) {
-  const p = boulderPath(workdir);
+// ---------------------------------------------------------------------------
+// boulder.json — Read / Write / Create / Update (per-loop instance)
+// ---------------------------------------------------------------------------
+
+export async function readBoulder(workdir, loopId) {
+  const p = boulderPath(workdir, loopId);
   if (!existsSync(p)) return null;
   try {
     const raw = await readFile(p, "utf-8");
@@ -81,14 +328,18 @@ export async function readBoulder(workdir) {
   }
 }
 
-export async function writeBoulder(workdir, state) {
+export async function writeBoulder(workdir, loopId, state) {
   state.updated_at = new Date().toISOString();
   state.stats = computeStats(state);
-  await ensureDir(loopDir(workdir));
-  await writeFile(boulderPath(workdir), JSON.stringify(state, null, 2), "utf-8");
+  await ensureDir(loopInstanceDir(workdir, loopId));
+  await writeFile(
+    boulderPath(workdir, loopId),
+    JSON.stringify(state, null, 2),
+    "utf-8"
+  );
 }
 
-export function createBoulder(planPath, planName, tasks, orchestratorSessionId) {
+export function createBoulder(loopId, planPath, planName, tasks, orchestratorSessionId) {
   const now = new Date().toISOString();
   const taskSessions = {};
 
@@ -104,6 +355,7 @@ export function createBoulder(planPath, planName, tasks, orchestratorSessionId) 
   }
 
   return {
+    loop_id: loopId,
     active_plan: planPath,
     plan_name: planName,
     started_at: now,
@@ -256,6 +508,10 @@ export function shouldHalt(state) {
   return remaining.length > 0 && remaining.every((task) => task.status === "blocked");
 }
 
+// ---------------------------------------------------------------------------
+// Plan Parsing
+// ---------------------------------------------------------------------------
+
 export async function parsePlan(planPath) {
   const raw = await readFile(planPath, "utf-8");
   const name = basename(planPath, ".md");
@@ -350,8 +606,12 @@ function parseDependencies(body) {
   return deps || undefined;
 }
 
-export async function writeHandoff(workdir, handoff) {
-  const dir = handoffsDir(workdir);
+// ---------------------------------------------------------------------------
+// Handoff Files — Per-loop instance
+// ---------------------------------------------------------------------------
+
+export async function writeHandoff(workdir, loopId, handoff) {
+  const dir = handoffsDir(workdir, loopId);
   await ensureDir(dir);
 
   const fileName = `${handoff.meta.task_key.replace(":", "-")}-handoff.md`;
@@ -391,17 +651,17 @@ ${handoff.next_task_context}
   return filePath;
 }
 
-export async function readHandoff(workdir, taskKey) {
+export async function readHandoff(workdir, loopId, taskKey) {
   const fileName = `${taskKey.replace(":", "-")}-handoff.md`;
-  const filePath = join(handoffsDir(workdir), fileName);
+  const filePath = join(handoffsDir(workdir, loopId), fileName);
   if (!existsSync(filePath)) return null;
 
   const raw = await readFile(filePath, "utf-8");
   return parseHandoff(raw);
 }
 
-export async function readLatestHandoff(workdir) {
-  const dir = handoffsDir(workdir);
+export async function readLatestHandoff(workdir, loopId) {
+  const dir = handoffsDir(workdir, loopId);
   if (!existsSync(dir)) return null;
 
   const files = (await readdir(dir)).filter((f) => f.endsWith("-handoff.md"));
@@ -449,22 +709,30 @@ function extractFmValue(frontmatter, key) {
   return match ? match[1].trim() : "";
 }
 
-export async function readNotepad(workdir, planName, noteType) {
-  const path = join(notepadsDir(workdir, planName), `${noteType}.md`);
-  if (!existsSync(path)) return "";
-  return readFile(path, "utf-8");
+// ---------------------------------------------------------------------------
+// Notepad System — Per-loop instance
+// ---------------------------------------------------------------------------
+
+export async function readNotepad(workdir, loopId, noteType) {
+  const p = join(notepadsDir(workdir, loopId), `${noteType}.md`);
+  if (!existsSync(p)) return "";
+  return readFile(p, "utf-8");
 }
 
-export async function appendNotepad(workdir, planName, noteType, content) {
-  const dir = notepadsDir(workdir, planName);
+export async function appendNotepad(workdir, loopId, noteType, content) {
+  const dir = notepadsDir(workdir, loopId);
   await ensureDir(dir);
 
-  const path = join(dir, `${noteType}.md`);
-  const existing = existsSync(path) ? await readFile(path, "utf-8") : "";
+  const p = join(dir, `${noteType}.md`);
+  const existing = existsSync(p) ? await readFile(p, "utf-8") : "";
   const timestamp = new Date().toISOString().slice(0, 19);
   const appended = `${existing}\n\n### [${timestamp}]\n${content}`.trim();
-  await writeFile(path, appended + "\n", "utf-8");
+  await writeFile(p, appended + "\n", "utf-8");
 }
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
 
 async function ensureDir(dir) {
   if (!existsSync(dir)) {

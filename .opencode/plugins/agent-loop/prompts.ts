@@ -243,6 +243,8 @@ export function buildContinuationPrompt(ctx: ContinuationContext): string {
  * orchestrator doesn't lose track of loop state after compaction.
  */
 export function buildCompactionContext(state: BoulderState): string {
+  const loopId = state.loop_id || state.plan_name;
+
   const doneTasks = Object.values(state.task_sessions)
     .filter((t) => t.status === "done")
     .map((t) => `  ✅ ${t.task_key}: ${t.task_title}`)
@@ -260,6 +262,7 @@ export function buildCompactionContext(state: BoulderState): string {
 
   return `## Agent Loop State (preserved across compaction)
 
+**Loop ID**: ${loopId}
 **Plan**: ${state.plan_name} (${state.active_plan})
 **Status**: ${state.status}
 **Iteration**: ${state.iteration}/${state.max_iterations}
@@ -275,9 +278,9 @@ ${blockedTasks ? `### Blocked Tasks\n${blockedTasks}` : ""}
 
 **Current task**: ${state.current_task || "(none — pick next)"}
 
-Read \`.agent-loop/boulder.json\` for full state.
-Read \`.agent-loop/handoffs/\` for latest handoff context.
-Read \`.agent-loop/notepads/${state.plan_name}/\` for accumulated learnings.
+Read \`.agent-loop/loops/${loopId}/boulder.json\` for full state.
+Read \`.agent-loop/loops/${loopId}/handoffs/\` for latest handoff context.
+Read \`.agent-loop/loops/${loopId}/notepads/\` for accumulated learnings.
 `;
 }
 
@@ -296,10 +299,18 @@ You are a loop orchestrator managing a multi-step coding plan through subagent d
 
 ## Your Role
 1. Read the plan from \`.agent-loop/plans/\`
-2. Read current state from \`.agent-loop/boulder.json\`
+2. Read current state from \`.agent-loop/loops/{loop_id}/boulder.json\`
 3. For each task in order, dispatch a worker subagent using the Task tool
 4. After each worker returns, process the handoff, run the backpressure gate, and update state
 5. Continue until all tasks are complete or the loop is halted
+
+## Multi-Instance Isolation
+Each Agent Loop instance has its own directory under \`.agent-loop/loops/{loop_id}/\` containing:
+- \`boulder.json\` — loop state
+- \`loop-state.json\` — runtime state
+- \`handoffs/\` — per-task handoff files
+- \`notepads/\` — accumulated learnings/decisions/issues
+The active loop is tracked by \`.agent-loop/active-loop.json\`.
 
 ## Rules
 - NEVER do the implementation work yourself. Always delegate to a worker subagent.

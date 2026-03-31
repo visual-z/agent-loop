@@ -166,6 +166,8 @@ export function buildContinuationPrompt(ctx) {
 }
 
 export function buildCompactionContext(state) {
+  const loopId = state.loop_id || state.plan_name;
+
   const doneTasks = Object.values(state.task_sessions)
     .filter((t) => t.status === "done")
     .map((t) => `  [done] ${t.task_key}: ${t.task_title}`)
@@ -183,6 +185,7 @@ export function buildCompactionContext(state) {
 
   return `## Agent Loop State (preserved across compaction)
 
+**Loop ID**: ${loopId}
 **Plan**: ${state.plan_name} (${state.active_plan})
 **Status**: ${state.status}
 **Iteration**: ${state.iteration}/${state.max_iterations}
@@ -198,9 +201,9 @@ ${blockedTasks ? `### Blocked Tasks\n${blockedTasks}` : ""}
 
 **Current task**: ${state.current_task || "(none - pick next)"}
 
-Read \.agent-loop/boulder.json for full state.
-Read \.agent-loop/handoffs/ for latest handoff context.
-Read \.agent-loop/notepads/${state.plan_name}/ for accumulated learnings.
+Read \`.agent-loop/loops/${loopId}/boulder.json\` for full state.
+Read \`.agent-loop/loops/${loopId}/handoffs/\` for latest handoff context.
+Read \`.agent-loop/loops/${loopId}/notepads/\` for accumulated learnings.
 `;
 }
 

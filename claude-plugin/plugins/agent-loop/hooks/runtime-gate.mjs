@@ -31,6 +31,44 @@ function isOrchestrator(agentType) {
   );
 }
 
+async function readJson(path) {
+  if (!existsSync(path)) return null;
+  try {
+    return JSON.parse(await readFile(path, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the active loop's boulder.json and loop-state.json.
+ */
+async function resolveActiveLoop(cwd) {
+  // Try new multi-instance layout first
+  const pointerPath = join(cwd, ".agent-loop", "active-loop.json");
+  const pointer = await readJson(pointerPath);
+  if (pointer?.loop_id) {
+    const loopDir = join(cwd, ".agent-loop", "loops", pointer.loop_id);
+    return {
+      loopId: pointer.loop_id,
+      boulder: await readJson(join(loopDir, "boulder.json")),
+      runtime: await readJson(join(loopDir, "loop-state.json")),
+    };
+  }
+
+  // Fall back to old single-instance layout
+  const boulder = await readJson(join(cwd, ".agent-loop", "boulder.json"));
+  if (boulder) {
+    return {
+      loopId: boulder.plan_name || null,
+      boulder,
+      runtime: await readJson(join(cwd, ".agent-loop", "loop-state.json")),
+    };
+  }
+
+  return null;
+}
+
 async function shouldGuard(input) {
   if (isOrchestrator(input.agent_type)) return true;
 
@@ -38,9 +76,9 @@ async function shouldGuard(input) {
   if (!sessionId) return false;
 
   const cwd = input.cwd || process.cwd();
-  const boulder = await readJson(join(cwd, ".agent-loop", "boulder.json"));
-  if (!boulder || boulder.status !== "running") return false;
-  return boulder.orchestrator_session_id === sessionId;
+  const loop = await resolveActiveLoop(cwd);
+  if (!loop?.boulder || loop.boulder.status !== "running") return false;
+  return loop.boulder.orchestrator_session_id === sessionId;
 }
 
 function emitBlock(reason) {
@@ -57,22 +95,15 @@ function emitBlock(reason) {
   );
 }
 
-async function readJson(path) {
-  if (!existsSync(path)) return null;
-  try {
-    return JSON.parse(await readFile(path, "utf-8"));
-  } catch {
-    return null;
-  }
-}
-
 const input = parseJson(await readStdin());
 if (!(await shouldGuard(input))) {
   process.exit(0);
 }
 
 const cwd = input.cwd || process.cwd();
-const runtime = await readJson(join(cwd, ".agent-loop", "loop-state.json"));
+const loop = await resolveActiveLoop(cwd);
+const runtime = loop?.runtime || null;
+
 if (runtime?.pending_save_progress) {
   emitBlock(
     "Agent Loop runtime requires session recycle. Do not continue dispatching workers in this session."

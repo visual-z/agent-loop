@@ -7,9 +7,20 @@
 .opencode/bun.lock
 
 # Local runtime state (keep templates/plans, ignore live loop state)
+# New multi-instance layout
+.agent-loop/active-loop.json
+.agent-loop/loops/*/boulder.json
+.agent-loop/loops/*/loop-state.json
+.agent-loop/loops/*/handoffs/*-handoff.md
+.agent-loop/loops/*/notepads/
+.agent-loop/loops/*/evidence/
+.agent-loop/loops/*/report-*.md
+
+# Old single-instance layout (kept during migration period)
 .agent-loop/boulder.json
 .agent-loop/loop-state.json
 .agent-loop/report-*.md
+.agent-loop/notepads/
 .agent-loop/handoffs/*-handoff.md
 
 # Local scratch state

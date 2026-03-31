@@ -73,9 +73,26 @@ export interface LoopRuntimeState {
   context_pressure_threshold: number;
 }
 
+/** Pointer file (.agent-loop/active-loop.json) — tracks which loop is active */
+export interface ActiveLoopPointer {
+  loop_id: string;
+  activated_at: string;
+}
+
+/** Summary of a loop instance for listing */
+export interface LoopSummary {
+  loop_id: string;
+  plan_name: string;
+  status: LoopStatus;
+  progress: string;
+  started_at: string;
+  updated_at: string;
+}
+
 /** The boulder.json root shape */
 export interface BoulderState {
   // Identity
+  loop_id: string; // unique ID for this loop instance (= plan name)
   active_plan: string; // path to plan file
   plan_name: string;
   started_at: string;

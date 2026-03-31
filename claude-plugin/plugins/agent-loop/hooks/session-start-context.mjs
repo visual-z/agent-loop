@@ -39,15 +39,53 @@ function isOrchestrator(agentType) {
   );
 }
 
+/**
+ * Resolve the active loop's boulder.json and loop-state.json paths.
+ * Returns { boulder, boulderPath, runtime, runtimePath, loopId } or null.
+ */
+async function resolveActiveLoop(cwd) {
+  // Try new multi-instance layout first
+  const pointerPath = join(cwd, ".agent-loop", "active-loop.json");
+  const pointer = await readJson(pointerPath);
+  if (pointer?.loop_id) {
+    const loopDir = join(cwd, ".agent-loop", "loops", pointer.loop_id);
+    const bPath = join(loopDir, "boulder.json");
+    const rPath = join(loopDir, "loop-state.json");
+    return {
+      loopId: pointer.loop_id,
+      boulderPath: bPath,
+      runtimePath: rPath,
+      boulder: await readJson(bPath),
+      runtime: await readJson(rPath),
+    };
+  }
+
+  // Fall back to old single-instance layout
+  const bPath = join(cwd, ".agent-loop", "boulder.json");
+  const rPath = join(cwd, ".agent-loop", "loop-state.json");
+  const boulder = await readJson(bPath);
+  if (boulder) {
+    return {
+      loopId: boulder.plan_name || null,
+      boulderPath: bPath,
+      runtimePath: rPath,
+      boulder,
+      runtime: await readJson(rPath),
+    };
+  }
+
+  return null;
+}
+
 async function shouldInject(input) {
   if (isOrchestrator(input.agent_type)) return true;
   const cwd = input.cwd || process.cwd();
-  const boulder = await readJson(join(cwd, ".agent-loop", "boulder.json"));
-  if (!boulder || boulder.status !== "running") return false;
+  const loop = await resolveActiveLoop(cwd);
+  if (!loop?.boulder || loop.boulder.status !== "running") return false;
 
   const sessionId = input.session_id || null;
   if (!sessionId) return false;
-  return boulder.orchestrator_session_id === sessionId;
+  return loop.boulder.orchestrator_session_id === sessionId;
 }
 
 function toText(payload) {
@@ -60,13 +98,13 @@ if (!(await shouldInject(input))) {
 }
 
 const cwd = input.cwd || process.cwd();
-const boulder = await readJson(join(cwd, ".agent-loop", "boulder.json"));
-const runtimePath = join(cwd, ".agent-loop", "loop-state.json");
-const runtime = await readJson(runtimePath);
+const loop = await resolveActiveLoop(cwd);
 
-if (!boulder) {
+if (!loop?.boulder) {
   process.exit(0);
 }
+
+const { boulder, runtime, runtimePath } = loop;
 
 if (runtime && boulder.status === "running") {
   const updatedRuntime = {
@@ -95,6 +133,7 @@ const nextTasks = Object.values(boulder.task_sessions || {})
 
 const lines = [
   "## Agent Loop Runtime Context",
+  `Loop ID: ${loop.loopId || "(unknown)"}`,
   `Plan: ${boulder.plan_name}`,
   `Status: ${boulder.status}`,
   `Progress: ${done}/${total}`,

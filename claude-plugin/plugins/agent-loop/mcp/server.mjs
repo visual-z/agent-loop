@@ -1,5 +1,22 @@
 #!/usr/bin/env bun
 
+// =============================================================================
+// Agent Loop MCP Server (Multi-Instance Isolated)
+// =============================================================================
+//
+// MCP server for Claude Code that orchestrates multi-step coding tasks through
+// subagent delegation with full context isolation per loop instance.
+//
+// ISOLATION MODEL:
+//   Each Agent Loop instance has a unique loop_id (= plan name) and its own
+//   directory under .agent-loop/loops/{loopId}/ containing boulder.json,
+//   loop-state.json, handoffs/, notepads/, and evidence/.
+//
+//   The server holds an activeLoopId in memory. All tools operate exclusively
+//   on the active loop. An active-loop.json pointer persists the active loop
+//   to disk for cross-session continuity.
+// =============================================================================
+
 import { spawn } from "child_process";
 import { existsSync } from "fs";
 import { mkdir, writeFile } from "fs/promises";
@@ -29,7 +46,13 @@ import {
   readNotepad,
   appendNotepad,
   loopDir,
+  loopInstanceDir,
   plansDir,
+  listLoops,
+  readActiveLoopPointer,
+  writeActiveLoopPointer,
+  clearActiveLoopPointer,
+  migrateOldLayout,
 } from "./core/state.mjs";
 
 import {
@@ -47,10 +70,56 @@ import {
 
 const workdir = resolve(process.env.AGENT_LOOP_WORKDIR || process.cwd());
 
+// ---------------------------------------------------------------------------
+// In-memory state — lives for the server's lifetime
+// ---------------------------------------------------------------------------
+
+/** The currently active loop ID (= plan name) */
+let activeLoopId = null;
+
+// ---------------------------------------------------------------------------
+// Startup: Auto-migration + restore active loop pointer
+// ---------------------------------------------------------------------------
+
+try {
+  const migratedId = await migrateOldLayout(workdir);
+  if (migratedId) {
+    activeLoopId = migratedId;
+  }
+
+  if (!activeLoopId) {
+    const pointer = await readActiveLoopPointer(workdir);
+    if (pointer) {
+      const state = await readBoulder(workdir, pointer.loop_id);
+      if (state && (state.status === "running" || state.status === "paused")) {
+        activeLoopId = pointer.loop_id;
+      }
+    }
+  }
+} catch {
+  // Non-fatal — startup continues without active loop
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 function jsonResult(payload) {
   return {
     content: [{ type: "text", text: JSON.stringify(payload) }],
   };
+}
+
+function isTerminalLoopStatus(status) {
+  return status === "completed" || status === "halted" || status === "failed";
+}
+
+async function clearActiveLoopIfTerminal(loopId, status) {
+  if (!loopId || !isTerminalLoopStatus(status)) return;
+  await clearActiveLoopPointer(workdir);
+  if (activeLoopId === loopId) {
+    activeLoopId = null;
+  }
 }
 
 async function runShell(cmd) {
@@ -97,12 +166,12 @@ async function runShell(cmd) {
   });
 }
 
-async function ensureRuntimeState(sessionId) {
-  const existing = await readRuntimeState(workdir);
+async function ensureRuntimeState(loopId, sessionId) {
+  const existing = await readRuntimeState(workdir, loopId);
   if (existing) return existing;
 
   const created = createRuntimeState(sessionId || null);
-  await writeRuntimeState(workdir, created);
+  await writeRuntimeState(workdir, loopId, created);
   return created;
 }
 
@@ -126,10 +195,10 @@ function extractFilePaths(text) {
   return [...paths];
 }
 
-async function buildPayloadForTask(state, task) {
-  const learnings = await readNotepad(workdir, state.plan_name, "learnings");
-  const decisions = await readNotepad(workdir, state.plan_name, "decisions");
-  const issues = await readNotepad(workdir, state.plan_name, "issues");
+async function buildPayloadForTask(loopId, state, task) {
+  const learnings = await readNotepad(workdir, loopId, "learnings");
+  const decisions = await readNotepad(workdir, loopId, "decisions");
+  const issues = await readNotepad(workdir, loopId, "issues");
 
   let previousContext = "";
   const doneTasks = Object.values(state.task_sessions)
@@ -138,7 +207,7 @@ async function buildPayloadForTask(state, task) {
 
   if (doneTasks.length > 0) {
     const lastDone = doneTasks[doneTasks.length - 1];
-    const handoff = await readHandoff(workdir, lastDone.task_key);
+    const handoff = await readHandoff(workdir, loopId, lastDone.task_key);
     if (handoff) previousContext = handoff.next_task_context;
   }
 
@@ -169,6 +238,10 @@ function parseToolArgs(raw) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Tools
+// ---------------------------------------------------------------------------
+
 const tools = [
   {
     name: "agent_loop_init",
@@ -185,15 +258,8 @@ const tools = [
       additionalProperties: false,
     },
     async execute(args) {
-      const state = await readBoulder(workdir);
-      if (state && state.status === "running") {
-        return {
-          error: "Loop already active",
-          plan: state.plan_name,
-          progress: `${state.stats.done}/${state.stats.total_tasks}`,
-          hint: "Use agent_loop_resume to continue.",
-        };
-      }
+      // Run migration first if needed
+      await migrateOldLayout(workdir);
 
       let planPath = "";
       if (args.plan_path) {
@@ -222,15 +288,34 @@ const tools = [
         };
       }
 
+      const loopId = plan.name;
+
+      // Check if a loop with this ID already exists and is running
+      const existing = await readBoulder(workdir, loopId);
+      if (existing && existing.status === "running") {
+        return {
+          error: "Loop already active",
+          loop_id: loopId,
+          plan: existing.plan_name,
+          progress: `${existing.stats.done}/${existing.stats.total_tasks}`,
+          hint: "Use agent_loop_resume to continue, or agent_loop_halt to stop it first.",
+        };
+      }
+
       const orchestratorSessionId = args.session_id || null;
-      const nextState = createBoulder(planPath, plan.name, plan.tasks, orchestratorSessionId);
-      await writeBoulder(workdir, nextState);
+      const nextState = createBoulder(loopId, planPath, plan.name, plan.tasks, orchestratorSessionId);
+      await writeBoulder(workdir, loopId, nextState);
 
       const runtime = createRuntimeState(orchestratorSessionId, nextState.started_at);
-      await writeRuntimeState(workdir, runtime);
+      await writeRuntimeState(workdir, loopId, runtime);
+
+      // Activate the loop
+      activeLoopId = loopId;
+      await writeActiveLoopPointer(workdir, loopId);
 
       return {
         status: "initialized",
+        loop_id: loopId,
         plan_name: plan.name,
         total_tasks: plan.tasks.length,
         tasks: plan.tasks.map((task) => ({ key: task.key, title: task.title })),
@@ -240,33 +325,91 @@ const tools = [
   },
   {
     name: "agent_loop_resume",
-    description: "Resume an existing Agent Loop and reset runtime session counters.",
+    description:
+      "Resume an existing Agent Loop. If multiple resumable loops exist, returns a list for selection. Pass loop_id to pick one.",
     inputSchema: {
       type: "object",
       properties: {
         session_id: { type: "string" },
+        loop_id: {
+          type: "string",
+          description: "The loop ID to resume. Omit to auto-select or list.",
+        },
       },
       additionalProperties: false,
     },
     async execute(args) {
-      const state = await readBoulder(workdir);
+      // Run migration first if needed
+      await migrateOldLayout(workdir);
+
+      let targetLoopId = args.loop_id;
+
+      if (!targetLoopId) {
+        // Discover available loops
+        const loops = await listLoops(workdir);
+        const resumable = loops.filter(
+          (l) => l.status === "running" || l.status === "paused" || l.status === "planning"
+        );
+
+        if (resumable.length === 0) {
+          if (loops.length === 0) {
+            return {
+              error: "No Agent Loop instances found. Use agent_loop_init to start a new one.",
+            };
+          }
+          return {
+            error: "No resumable loops found. All loops are completed/halted/failed.",
+            all_loops: loops.map((l) => ({
+              loop_id: l.loop_id,
+              status: l.status,
+              progress: l.progress,
+              updated_at: l.updated_at,
+            })),
+            hint: "Use agent_loop_init to start a new loop.",
+          };
+        }
+
+        if (resumable.length === 1) {
+          targetLoopId = resumable[0].loop_id;
+        } else {
+          return {
+            action: "select_loop",
+            message:
+              "Multiple resumable Agent Loops found. Please specify which one to resume by calling agent_loop_resume with loop_id.",
+            resumable_loops: resumable.map((l) => ({
+              loop_id: l.loop_id,
+              plan_name: l.plan_name,
+              status: l.status,
+              progress: l.progress,
+              started_at: l.started_at,
+              updated_at: l.updated_at,
+            })),
+          };
+        }
+      }
+
+      const state = await readBoulder(workdir, targetLoopId);
       if (!state) {
-        return { error: "No boulder.json found. Use agent_loop_init." };
+        return {
+          error: `No boulder.json found for loop "${targetLoopId}". Use agent_loop_init to start a new loop.`,
+          available_loops: (await listLoops(workdir)).map((l) => l.loop_id),
+        };
       }
 
       if (state.status === "completed") {
         return {
           status: "completed",
+          loop_id: targetLoopId,
           plan: state.plan_name,
-          message: "Loop already completed.",
+          message: "This loop is already completed.",
         };
       }
 
-      const runtime = await ensureRuntimeState(args.session_id || null);
+      const runtime = await ensureRuntimeState(targetLoopId, args.session_id || null);
 
       state.orchestrator_session_id = args.session_id || runtime.session_id || state.orchestrator_session_id;
       state.status = "running";
-      await writeBoulder(workdir, state);
+      await writeBoulder(workdir, targetLoopId, state);
 
       runtime.active = true;
       runtime.session_id = state.orchestrator_session_id || runtime.session_id;
@@ -274,13 +417,18 @@ const tools = [
       runtime.iteration = 0;
       runtime.stall_count = 0;
       runtime.last_state_hash = null;
-      await writeRuntimeState(workdir, runtime);
+      await writeRuntimeState(workdir, targetLoopId, runtime);
+
+      // Activate this loop
+      activeLoopId = targetLoopId;
+      await writeActiveLoopPointer(workdir, targetLoopId);
 
       const nextKey = pickNextTask(state);
-      const latestHandoff = await readLatestHandoff(workdir);
+      const latestHandoff = await readLatestHandoff(workdir, targetLoopId);
 
       return {
         status: "resumed",
+        loop_id: targetLoopId,
         plan: state.plan_name,
         iteration: state.iteration,
         progress: `${state.stats.done}/${state.stats.total_tasks}`,
@@ -288,6 +436,12 @@ const tools = [
         next_task: nextKey,
         next_task_title: nextKey ? state.task_sessions[nextKey]?.task_title : null,
         latest_handoff_context: latestHandoff?.next_task_context || null,
+        tasks: Object.values(state.task_sessions).map((t) => ({
+          key: t.task_key,
+          title: t.task_title,
+          status: t.status,
+          attempts: t.attempts,
+        })),
       };
     },
   },
@@ -304,10 +458,14 @@ const tools = [
       additionalProperties: false,
     },
     async execute(args) {
-      const state = await readBoulder(workdir);
-      if (!state) return { error: "No active loop. Call agent_loop_init first." };
+      if (!activeLoopId) {
+        return { error: "No active loop. Call agent_loop_init or agent_loop_resume first." };
+      }
 
-      const runtime = await readRuntimeState(workdir);
+      const state = await readBoulder(workdir, activeLoopId);
+      if (!state) return { error: "No active loop state. Call agent_loop_init first." };
+
+      const runtime = await readRuntimeState(workdir, activeLoopId);
       if (runtime?.pending_save_progress) {
         return {
           error: "Session recycle required before dispatching more workers.",
@@ -350,11 +508,11 @@ const tools = [
         return { error: `Task ${args.task_key} not found in plan file.` };
       }
 
-      const payload = await buildPayloadForTask(state, task);
+      const payload = await buildPayloadForTask(activeLoopId, state, task);
       const workerPrompt = buildWorkerPrompt(payload);
 
       markTaskStarted(state, args.task_key, args.worker_session_id);
-      await writeBoulder(workdir, state);
+      await writeBoulder(workdir, activeLoopId, state);
 
       return {
         action: "dispatch",
@@ -381,7 +539,11 @@ const tools = [
       additionalProperties: false,
     },
     async execute(args) {
-      const state = await readBoulder(workdir);
+      if (!activeLoopId) {
+        return { error: "No active loop." };
+      }
+
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state) return { error: "No active loop." };
 
       const taskSession = state.task_sessions[args.task_key];
@@ -411,7 +573,7 @@ const tools = [
           args.task_key,
           "Worker did not produce HANDOFF_START...HANDOFF_END block."
         );
-        await writeBoulder(workdir, state);
+        await writeBoulder(workdir, activeLoopId, state);
 
         return {
           status: "failed",
@@ -439,6 +601,7 @@ const tools = [
         .filter(Boolean)
         .join("\n");
 
+      // Write handoff file (scoped to this loop)
       const handoffFile = {
         meta: {
           task_key: args.task_key,
@@ -449,21 +612,22 @@ const tools = [
         },
         ...parsed,
       };
-      await writeHandoff(workdir, handoffFile);
+      await writeHandoff(workdir, activeLoopId, handoffFile);
 
+      // Append learnings to notepad (scoped to this loop)
       if (parsed.learnings?.trim()) {
         await appendNotepad(
           workdir,
-          state.plan_name,
+          activeLoopId,
           "learnings",
           `From ${args.task_key} (${taskSession.task_title}):\n${parsed.learnings}`
         );
       }
       if (parsed.key_decisions?.trim()) {
-        await appendNotepad(workdir, state.plan_name, "decisions", `From ${args.task_key}:\n${parsed.key_decisions}`);
+        await appendNotepad(workdir, activeLoopId, "decisions", `From ${args.task_key}:\n${parsed.key_decisions}`);
       }
       if (parsed.blocked_issues?.trim() && parsed.blocked_issues !== "None") {
-        await appendNotepad(workdir, state.plan_name, "issues", `From ${args.task_key}:\n${parsed.blocked_issues}`);
+        await appendNotepad(workdir, activeLoopId, "issues", `From ${args.task_key}:\n${parsed.blocked_issues}`);
       }
 
       if (parsed.status === "blocked") {
@@ -472,7 +636,7 @@ const tools = [
           args.task_key,
           parsed.blocked_issues || "Worker reported blocked status"
         );
-        await writeBoulder(workdir, state);
+        await writeBoulder(workdir, activeLoopId, state);
 
         const nextKey = pickNextTask(state);
         return {
@@ -490,7 +654,7 @@ const tools = [
           args.task_key,
           parsed.blocked_issues || "Worker reported failure"
         );
-        await writeBoulder(workdir, state);
+        await writeBoulder(workdir, activeLoopId, state);
 
         const nextKey = pickNextTask(state);
         return {
@@ -539,19 +703,29 @@ const tools = [
         );
       }
 
-      await writeBoulder(workdir, state);
-
       const nextKey = pickNextTask(state);
       const allDone = isLoopComplete(state);
       const halted = shouldHalt(state);
-      const doneTasks = Object.values(state.task_sessions).filter((task) => task.status === "done");
+      const doneTasksList = Object.values(state.task_sessions).filter((task) => task.status === "done");
+
+      let runtime = null;
 
       if (allDone) {
         state.status = "completed";
-        await writeBoulder(workdir, state);
       } else if (halted) {
         state.status = "halted";
-        await writeBoulder(workdir, state);
+      }
+
+      await writeBoulder(workdir, activeLoopId, state);
+
+      if (isTerminalLoopStatus(state.status)) {
+        runtime = await readRuntimeState(workdir, activeLoopId);
+        if (runtime) {
+          runtime.active = false;
+          runtime.pending_save_progress = false;
+          await writeRuntimeState(workdir, activeLoopId, runtime);
+        }
+        await clearActiveLoopIfTerminal(activeLoopId, state.status);
       }
 
       return {
@@ -565,7 +739,7 @@ const tools = [
           lint: gateResult.lint ? { passed: gateResult.lint.passed } : null,
         },
         gate_details: gateResult.passed ? undefined : formatGateResult(gateResult),
-        progress: `${doneTasks.length}/${state.stats.total_tasks}`,
+        progress: `${doneTasksList.length}/${state.stats.total_tasks}`,
         all_done: allDone,
         halted,
         next_task: nextKey,
@@ -578,22 +752,58 @@ const tools = [
     description: "Return loop status, runtime controls, task states, and latest handoff summary.",
     inputSchema: {
       type: "object",
-      properties: {},
+      properties: {
+        loop_id: {
+          type: "string",
+          description: "Specific loop ID to check. Omit to see the active loop and list all loops.",
+        },
+      },
       additionalProperties: false,
     },
-    async execute() {
-      const state = await readBoulder(workdir);
-      const runtime = await readRuntimeState(workdir);
-      if (!state) {
+    async execute(args) {
+      // Run migration first if needed
+      await migrateOldLayout(workdir);
+
+      const targetLoopId = args.loop_id || activeLoopId;
+
+      // If no specific loop requested and no active loop, list all
+      if (!targetLoopId) {
+        const loops = await listLoops(workdir);
         return {
           active: false,
-          message: "No active Agent Loop. Use agent_loop_init.",
+          active_loop_id: null,
+          message: loops.length === 0
+            ? "No Agent Loop instances found. Use agent_loop_init to start one."
+            : "No active loop in this session. Use agent_loop_resume to continue one.",
+          all_loops: loops.map((l) => ({
+            loop_id: l.loop_id,
+            plan_name: l.plan_name,
+            status: l.status,
+            progress: l.progress,
+            started_at: l.started_at,
+            updated_at: l.updated_at,
+          })),
         };
       }
 
-      const latestHandoff = await readLatestHandoff(workdir);
+      const state = await readBoulder(workdir, targetLoopId);
+      const runtime = await readRuntimeState(workdir, targetLoopId);
+      if (!state) {
+        return {
+          active: false,
+          loop_id: targetLoopId,
+          message: `Loop "${targetLoopId}" not found.`,
+          available_loops: (await listLoops(workdir)).map((l) => l.loop_id),
+        };
+      }
+
+      const latestHandoff = await readLatestHandoff(workdir, targetLoopId);
+      const allLoops = await listLoops(workdir);
+
       const status = {
         active: state.status === "running",
+        loop_id: targetLoopId,
+        is_current: targetLoopId === activeLoopId,
         plan: state.plan_name,
         status: state.status,
         iteration: state.iteration,
@@ -629,12 +839,19 @@ const tools = [
               summary: latestHandoff.what_was_done.slice(0, 200),
             }
           : null,
+        all_loops: allLoops.length > 1
+          ? allLoops.map((l) => ({
+              loop_id: l.loop_id,
+              status: l.status,
+              progress: l.progress,
+            }))
+          : undefined,
       };
 
       if (state.status === "running" && runtime?.active) {
         const nextKey = pickNextTask(state);
         const nextSession = nextKey ? state.task_sessions[nextKey] : null;
-        const doneTasks = Object.values(state.task_sessions).filter((t) => t.status === "done");
+        const doneTasksList = Object.values(state.task_sessions).filter((t) => t.status === "done");
 
         const continuation = buildContinuationPrompt({
           completed_task_key:
@@ -654,7 +871,7 @@ const tools = [
           next_task_key: nextKey,
           next_task_title: nextSession?.task_title || null,
           iteration: state.iteration,
-          progress: `${doneTasks.length}/${state.stats.total_tasks} tasks complete`,
+          progress: `${doneTasksList.length}/${state.stats.total_tasks} tasks complete`,
         });
 
         status.orchestrator_next_prompt = continuation;
@@ -674,10 +891,14 @@ const tools = [
       additionalProperties: false,
     },
     async execute(args) {
-      const state = await readBoulder(workdir);
+      if (!activeLoopId) {
+        return { error: "No active loop." };
+      }
+
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state) return { error: "No active loop." };
 
-      const runtime = await readRuntimeState(workdir);
+      const runtime = await readRuntimeState(workdir, activeLoopId);
       state.status = "paused";
 
       if (state.current_task) {
@@ -686,17 +907,22 @@ const tools = [
         state.current_task = null;
       }
 
-      await writeBoulder(workdir, state);
+      await writeBoulder(workdir, activeLoopId, state);
       if (runtime) {
         runtime.active = false;
         runtime.pending_save_progress = false;
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
       }
+
+      // Clear active loop pointer
+      await clearActiveLoopPointer(workdir);
 
       return {
         status: "paused",
+        loop_id: activeLoopId,
         reason: args.reason || "Manual halt",
         progress: `${state.stats.done}/${state.stats.total_tasks}`,
+        message: "Loop paused. Use agent_loop_resume to continue later.",
       };
     },
   },
@@ -729,34 +955,37 @@ const tools = [
       additionalProperties: false,
     },
     async execute(args) {
-      const state = await readBoulder(workdir);
-      if (!state) {
-        return { error: "No active loop - notepad requires plan context." };
+      if (!activeLoopId) {
+        return { error: "No active loop - notepad requires loop context." };
       }
 
-      await appendNotepad(workdir, state.plan_name, args.type, args.content);
+      await appendNotepad(workdir, activeLoopId, args.type, args.content);
       return {
         status: "appended",
         notepad: args.type,
-        plan: state.plan_name,
+        loop_id: activeLoopId,
       };
     },
   },
   {
     name: "agent_loop_completion_report",
-    description: "Generate completion report markdown and write it under .agent-loop/.",
+    description: "Generate completion report markdown and write it under the loop instance directory.",
     inputSchema: {
       type: "object",
       properties: {},
       additionalProperties: false,
     },
     async execute() {
-      const state = await readBoulder(workdir);
+      if (!activeLoopId) {
+        return { error: "No active loop." };
+      }
+
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state) return { error: "No loop state found." };
 
-      const learnings = await readNotepad(workdir, state.plan_name, "learnings");
-      const decisions = await readNotepad(workdir, state.plan_name, "decisions");
-      const issues = await readNotepad(workdir, state.plan_name, "issues");
+      const learnings = await readNotepad(workdir, activeLoopId, "learnings");
+      const decisions = await readNotepad(workdir, activeLoopId, "decisions");
+      const issues = await readNotepad(workdir, activeLoopId, "issues");
 
       const tasks = Object.values(state.task_sessions);
       const done = tasks.filter((task) => task.status === "done");
@@ -766,6 +995,7 @@ const tools = [
       const report = [
         "# Agent Loop Completion Report",
         "",
+        `**Loop ID**: ${activeLoopId}`,
         `**Plan**: ${state.plan_name}`,
         `**Started**: ${state.started_at}`,
         `**Completed**: ${state.updated_at}`,
@@ -790,11 +1020,11 @@ const tools = [
         .filter(Boolean)
         .join("\n");
 
-      const path = join(loopDir(workdir), `report-${state.plan_name}.md`);
-      await writeFile(path, report, "utf-8");
+      const reportPath = join(loopInstanceDir(workdir, activeLoopId), `report-${state.plan_name}.md`);
+      await writeFile(reportPath, report, "utf-8");
 
       return {
-        report_path: path,
+        report_path: reportPath,
         report,
       };
     },
@@ -826,10 +1056,20 @@ const tools = [
       additionalProperties: false,
     },
     async execute(args) {
-      const state = await readBoulder(workdir);
-      const runtime = await ensureRuntimeState(args.session_id || null);
+      if (!activeLoopId) {
+        return {
+          active: false,
+          reason: "no_active_loop",
+          hint: "Call agent_loop_init or agent_loop_resume first.",
+        };
+      }
+
+      const state = await readBoulder(workdir, activeLoopId);
+      const runtime = await ensureRuntimeState(activeLoopId, args.session_id || null);
 
       if (!state) {
+        await clearActiveLoopPointer(workdir);
+        activeLoopId = null;
         return {
           active: false,
           reason: "no_state",
@@ -871,13 +1111,15 @@ const tools = [
           state.current_task,
           args.error_message || "Runtime tick requested failure for current task."
         );
-        await writeBoulder(workdir, state);
+        await writeBoulder(workdir, activeLoopId, state);
       }
 
       if (state.status !== "running") {
         runtime.active = false;
         runtime.pending_save_progress = false;
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
+
+        await clearActiveLoopIfTerminal(activeLoopId, state.status);
         return {
           active: false,
           reason: "loop_not_running",
@@ -910,7 +1152,7 @@ const tools = [
 
       if (runtime.stall_count >= runtime.stall_threshold) {
         runtime.active = false;
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
         return {
           active: false,
           reason: "stalled",
@@ -922,11 +1164,12 @@ const tools = [
 
       if (runtime.total_iterations >= runtime.max_total_iterations) {
         state.status = "halted";
-        await writeBoulder(workdir, state);
+        await writeBoulder(workdir, activeLoopId, state);
 
         runtime.active = false;
         runtime.pending_save_progress = false;
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
+        await clearActiveLoopIfTerminal(activeLoopId, state.status);
 
         return {
           active: false,
@@ -944,7 +1187,7 @@ const tools = [
         runtime.pending_save_progress = true;
         runtime.active = false;
         runtime.last_continued_at = new Date().toISOString();
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
 
         return {
           active: false,
@@ -957,7 +1200,7 @@ const tools = [
       }
 
       if (runtime.pending_save_progress) {
-        await writeRuntimeState(workdir, runtime);
+        await writeRuntimeState(workdir, activeLoopId, runtime);
         return {
           active: false,
           reason: "pending_save_progress",
@@ -966,7 +1209,7 @@ const tools = [
       }
 
       if (!runtime.active) runtime.active = true;
-      await writeRuntimeState(workdir, runtime);
+      await writeRuntimeState(workdir, activeLoopId, runtime);
 
       return {
         active: true,
@@ -985,7 +1228,14 @@ const tools = [
       additionalProperties: false,
     },
     async execute() {
-      const state = await readBoulder(workdir);
+      if (!activeLoopId) {
+        return {
+          available: false,
+          reason: "no_active_loop",
+        };
+      }
+
+      const state = await readBoulder(workdir, activeLoopId);
       if (!state || state.status !== "running") {
         return {
           available: false,
@@ -1001,17 +1251,21 @@ const tools = [
   },
 ];
 
+// ---------------------------------------------------------------------------
+// MCP Server Setup
+// ---------------------------------------------------------------------------
+
 const server = new Server(
   {
     name: "agent-loop",
-    version: "0.1.0",
+    version: "0.2.0",
   },
   {
     capabilities: {
       tools: {},
     },
     instructions:
-      "Agent Loop MCP server. Use agent_loop_* tools to initialize, dispatch, process handoffs, enforce runtime controls, and produce completion reports from .agent-loop state.",
+      "Agent Loop MCP server (multi-instance). Use agent_loop_* tools to initialize, dispatch, process handoffs, enforce runtime controls, and produce completion reports. Each loop instance is isolated under .agent-loop/loops/{loop_id}/.",
   }
 );
 
