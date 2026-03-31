@@ -9,6 +9,64 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/**
+ * Ensure a relative plugin path is registered in the opencode config's "plugin" array.
+ * Creates the config file with a default structure if it doesn't exist.
+ * Returns true if the config was modified.
+ */
+function ensurePluginRegistered(configPath: string, relativePluginPath: string): boolean {
+  let config: Record<string, any>;
+
+  if (existsSync(configPath)) {
+    const raw = readFileSync(configPath, "utf8");
+    try {
+      config = JSON.parse(raw);
+    } catch {
+      // If we can't parse it, don't touch it
+      return false;
+    }
+  } else {
+    config = { "$schema": "https://opencode.ai/config.json" };
+  }
+
+  if (!Array.isArray(config.plugin)) {
+    config.plugin = [];
+  }
+
+  // Already registered?
+  if (config.plugin.includes(relativePluginPath)) {
+    return false;
+  }
+
+  config.plugin.push(relativePluginPath);
+  writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
+  return true;
+}
+
+/**
+ * Remove a plugin path from the opencode config's "plugin" array.
+ * Returns true if the config was modified.
+ */
+function removePluginFromConfig(configPath: string, relativePluginPath: string): boolean {
+  if (!existsSync(configPath)) return false;
+
+  let config: Record<string, any>;
+  try {
+    config = JSON.parse(readFileSync(configPath, "utf8"));
+  } catch {
+    return false;
+  }
+
+  if (!Array.isArray(config.plugin)) return false;
+
+  const idx = config.plugin.indexOf(relativePluginPath);
+  if (idx === -1) return false;
+
+  config.plugin.splice(idx, 1);
+  writeFileSync(configPath, JSON.stringify(config, null, 2) + "\n", "utf8");
+  return true;
+}
+
 function removeLegacyPluginPath(configPath: string, pluginPaths: string[]): boolean {
   if (!existsSync(configPath)) return false;
 
@@ -144,9 +202,15 @@ if (args.command === "uninstall") {
     .map((configPath) => removeLegacyPluginPath(configPath, [targetEntryPath]))
     .some(Boolean);
 
+  // Also remove from the plugin array in opencode.json
+  const pluginRelativePath = "./plugins/agent-loop.ts";
+  const removedFromConfig = configPaths
+    .map((configPath) => removePluginFromConfig(configPath, pluginRelativePath))
+    .some(Boolean);
+
   log(`Removed OpenCode plugin entry: ${targetEntryPath}`);
   log(`Removed OpenCode plugin directory: ${targetModuleDir}`);
-  if (removedEntries) {
+  if (removedEntries || removedFromConfig) {
     log("Removed plugin references from OpenCode config file.");
   }
   log("Uninstall complete.");
@@ -191,11 +255,21 @@ const removedLegacyPath = configPaths
   .map((configPath) => removeLegacyPluginPath(configPath, [sourceEntryPath, targetEntryPath]))
   .some(Boolean);
 
+// Register the plugin in opencode.json (prefer opencode.json; create if neither exists)
+const pluginRelativePath = "./plugins/agent-loop.ts";
+const primaryConfig = configPaths.find((p) => existsSync(p)) || configPaths[0];
+const registered = ensurePluginRegistered(primaryConfig, pluginRelativePath);
+
 log(`Installed OpenCode plugin to: ${targetEntryPath}`);
 log(`Installed OpenCode agents to: ${globalAgentsDir}`);
 log(`Installed OpenCode commands to: ${globalCommandsDir}`);
 if (removedLegacyPath) {
   log(`Removed legacy absolute plugin path from OpenCode config.`);
+}
+if (registered) {
+  log(`Registered plugin in ${primaryConfig}`);
+} else {
+  log(`Plugin already registered in ${primaryConfig}`);
 }
 
 log("Done. Verify with: opencode debug config");
