@@ -1,0 +1,40 @@
+{
+  "name": "@agent-loop/agent-loop-opencode",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "One-command OpenCode installer for Agent Loop",
+  "packageManager": "bun@1.3.10",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/visual-z/agent-loop.git"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "opencode",
+    "agent-loop",
+    "plugin",
+    "installer"
+  ],
+  "engines": {
+    "bun": ">=1.3.10"
+  },
+  "bin": {
+    "agent-loop-opencode": "bin/agent-loop-opencode.js"
+  },
+  "scripts": {
+    "install:opencode": "bun ./install-opencode-plugin.ts install",
+    "uninstall:opencode": "bun ./install-opencode-plugin.ts uninstall",
+    "status:opencode": "bun ./install-opencode-plugin.ts status"
+  },
+  "files": [
+    "bin",
+    "install-opencode-plugin.ts",
+    ".opencode/agents",
+    ".opencode/commands",
+    ".opencode/plugins",
+    "!**/node_modules/**"
+  ]
+}

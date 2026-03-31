@@ -1,0 +1,17 @@
+{
+  "name": "local-agent-loop-marketplace",
+  "owner": {
+    "name": "visual"
+  },
+  "metadata": {
+    "description": "Local marketplace for Agent Loop Claude plugin",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agent-loop",
+      "source": "./plugins/agent-loop",
+      "description": "Agent Loop orchestration for Claude Code with MCP tools, orchestrator/worker agents, and runtime guard hooks."
+    }
+  ]
+}

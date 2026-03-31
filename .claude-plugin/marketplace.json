@@ -1,0 +1,22 @@
+{
+  "name": "agent-loop",
+  "owner": {
+    "name": "visual",
+    "email": "visual_zyh@foxmail.com"
+  },
+  "metadata": {
+    "description": "Agent Loop plugin marketplace for Claude Code - orchestration with MCP tools, worker agents, and runtime guard hooks.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "agent-loop",
+      "source": "./claude-plugin/plugins/agent-loop",
+      "description": "Agent Loop orchestration for Claude Code with MCP tools, orchestrator/worker agents, and runtime guard hooks.",
+      "version": "0.1.0",
+      "category": "development-workflows",
+      "tags": ["agent", "orchestration", "loop", "mcp", "automation"],
+      "keywords": ["agent-loop", "orchestration", "worker", "mcp"]
+    }
+  ]
+}

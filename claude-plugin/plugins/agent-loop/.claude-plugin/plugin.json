@@ -1,0 +1,13 @@
+{
+  "name": "agent-loop",
+  "description": "Agent Loop orchestration for Claude Code with MCP tools, orchestrator/worker agents, and runtime guard hooks.",
+  "version": "0.1.0",
+  "author": {
+    "name": "visual",
+    "email": "visual_zyh@foxmail.com"
+  },
+  "homepage": "https://github.com/visual-z/agent-loop",
+  "repository": "https://github.com/visual-z/agent-loop",
+  "license": "MIT",
+  "keywords": ["agent-loop", "orchestration", "worker", "mcp", "automation"]
+}
