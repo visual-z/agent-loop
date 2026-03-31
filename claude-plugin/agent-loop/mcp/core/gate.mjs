@@ -10,6 +10,34 @@ export async function runBackpressureGate(runShell, workdir) {
     timestamp: new Date().toISOString(),
   };
 
+  const mode = (process.env.AGENT_LOOP_GATE_MODE || "auto").toLowerCase();
+  if (mode === "off") {
+    result.test = {
+      passed: true,
+      output: "Backpressure gate disabled via AGENT_LOOP_GATE_MODE=off",
+    };
+    return result;
+  }
+
+  const customCmd = process.env.AGENT_LOOP_GATE_CMD?.trim();
+  if (customCmd) {
+    try {
+      const customResult = await runShell(["sh", "-lc", customCmd]);
+      result.test = {
+        passed: customResult.exitCode === 0,
+        output: truncateOutput(customResult.stdout + "\n" + customResult.stderr),
+      };
+      result.passed = result.test.passed;
+    } catch (error) {
+      result.test = {
+        passed: false,
+        output: truncateOutput(error?.message || String(error)),
+      };
+      result.passed = false;
+    }
+    return result;
+  }
+
   const projectType = detectProjectType(workdir);
 
   const buildCmd = await getBuildCommand(projectType, workdir);
@@ -94,6 +122,12 @@ export function formatGateResult(result) {
 }
 
 export async function getBackpressureShellCommand(workdir) {
+  const mode = (process.env.AGENT_LOOP_GATE_MODE || "auto").toLowerCase();
+  if (mode === "off") return "echo 'Backpressure gate disabled (AGENT_LOOP_GATE_MODE=off)'";
+
+  const customCmd = process.env.AGENT_LOOP_GATE_CMD?.trim();
+  if (customCmd) return customCmd;
+
   const type = detectProjectType(workdir);
   const commands = [];
 

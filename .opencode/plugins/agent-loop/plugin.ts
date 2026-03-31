@@ -912,6 +912,23 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             return JSON.stringify({ error: `Unknown task: ${args.task_key}` });
           }
 
+          if (taskSession.status !== "in-progress") {
+            return JSON.stringify({
+              error: `Cannot process handoff for ${args.task_key} because task is ${taskSession.status}. Dispatch it first.`,
+              task_key: args.task_key,
+              task_status: taskSession.status,
+              current_task: state.current_task,
+            });
+          }
+
+          if (state.current_task && state.current_task !== args.task_key) {
+            return JSON.stringify({
+              error: `Cannot process handoff for ${args.task_key} while ${state.current_task} is current in-progress task.`,
+              task_key: args.task_key,
+              current_task: state.current_task,
+            });
+          }
+
           // Parse the handoff from worker output
           const parsed = parseHandoffFromWorkerOutput(args.worker_output);
 
@@ -928,11 +945,14 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
               status: "failed",
               reason: "No handoff block found in worker output",
               task_key: args.task_key,
-              attempts: taskSession.attempts,
-              max_attempts: taskSession.max_attempts,
-              can_retry: taskSession.attempts < taskSession.max_attempts,
+              attempts: state.task_sessions[args.task_key].attempts,
+              max_attempts: state.task_sessions[args.task_key].max_attempts,
+              can_retry:
+                state.task_sessions[args.task_key].attempts <
+                state.task_sessions[args.task_key].max_attempts,
               next_action:
-                taskSession.attempts < taskSession.max_attempts
+                state.task_sessions[args.task_key].attempts <
+                state.task_sessions[args.task_key].max_attempts
                   ? `Retry: call agent_loop_dispatch with task_key "${args.task_key}"`
                   : `Task blocked. Call agent_loop_dispatch with the next available task.`,
             });
@@ -1033,7 +1053,9 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
               task_key: args.task_key,
               reason: parsed.blocked_issues,
               summary: compressedSummary,
-              can_retry: taskSession.attempts < taskSession.max_attempts,
+              can_retry:
+                state.task_sessions[args.task_key].attempts <
+                state.task_sessions[args.task_key].max_attempts,
               next_task: nextKey,
               next_action: nextKey
                 ? `Dispatch next task: agent_loop_dispatch("${nextKey}")`
@@ -1129,7 +1151,8 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
               ? `Dispatch next: agent_loop_dispatch("${nextKey}")`
               : !gateResult.passed
               ? `Gate failed for ${args.task_key}. ${
-                  taskSession.attempts < taskSession.max_attempts
+                  state.task_sessions[args.task_key].attempts <
+                  state.task_sessions[args.task_key].max_attempts
                     ? `Retry: agent_loop_dispatch("${args.task_key}")`
                     : `Task blocked. Move to next: agent_loop_dispatch("${nextKey || "none"}")`
                 }`

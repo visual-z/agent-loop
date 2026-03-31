@@ -209,38 +209,67 @@ export function parseHandoffFromWorkerOutput(output) {
   if (!match) return null;
 
   const block = match[1];
-  const statusMatch = block.match(/^status:\s*(.+)$/m);
-  const status = (statusMatch?.[1]?.trim() || "done");
+  const statusMatch = block.match(/^status:\s*(.+)$/im);
+  const status = normalizeStatus(statusMatch?.[1]);
 
   return {
     status,
-    what_was_done: extractMarkdownSection(block, "What Was Done"),
-    key_decisions: extractMarkdownSection(block, "Key Decisions"),
-    files_changed: extractMarkdownSection(block, "Files Changed"),
-    test_results: extractMarkdownSection(block, "Test Results"),
-    learnings:
-      extractMarkdownSection(block, "Learnings for Next Tasks") ||
-      extractMarkdownSection(block, "Learnings for Future Tasks"),
-    blocked_issues:
-      extractMarkdownSection(block, "Blocked / Known Issues") ||
-      extractMarkdownSection(block, "Known Issues"),
-    next_task_context: extractMarkdownSection(block, "Next Task Context"),
+    what_was_done: extractHandoffSection(block, ["What Was Done"]),
+    key_decisions: extractHandoffSection(block, ["Key Decisions"]),
+    files_changed: extractHandoffSection(block, ["Files Changed"]),
+    test_results: extractHandoffSection(block, ["Test Results"]),
+    learnings: extractHandoffSection(block, [
+      "Learnings for Next Tasks",
+      "Learnings for Future Tasks",
+      "Learnings",
+    ]),
+    blocked_issues: extractHandoffSection(block, [
+      "Blocked / Known Issues",
+      "Blocked Issues",
+      "Known Issues",
+    ]),
+    next_task_context: extractHandoffSection(block, ["Next Task Context"]),
   };
 }
 
-function extractMarkdownSection(markdown, heading) {
-  const regex = new RegExp(
-    `^##\\s+${heading.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*$`,
-    "mi"
-  );
-  const match = regex.exec(markdown);
-  if (!match) return "";
+function normalizeStatus(raw) {
+  const value = (raw || "done").trim().toLowerCase();
+  if (value === "failed" || value === "blocked") return value;
+  return "done";
+}
 
-  const startIdx = match.index + match[0].length;
-  const rest = markdown.slice(startIdx);
-  const nextHeading = /^##\s+/m.exec(rest);
-  const endIdx = nextHeading ? nextHeading.index : rest.length;
-  return rest.slice(0, endIdx).trim();
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractHandoffSection(markdown, labels) {
+  for (const label of labels) {
+    const headingRegex = new RegExp(`^##\\s+${escapeRegex(label)}\\s*$`, "mi");
+    const headingMatch = headingRegex.exec(markdown);
+    if (headingMatch) {
+      const startIdx = headingMatch.index + headingMatch[0].length;
+      const rest = markdown.slice(startIdx);
+      const nextHeading = /^##\s+/m.exec(rest);
+      const endIdx = nextHeading ? nextHeading.index : rest.length;
+      const content = rest.slice(0, endIdx).trim();
+      if (content) return content;
+    }
+
+    const labelRegex = new RegExp(`^${escapeRegex(label)}:\\s*(.*)$`, "mi");
+    const labelMatch = labelRegex.exec(markdown);
+    if (!labelMatch) continue;
+
+    const startIdx = labelMatch.index + labelMatch[0].length;
+    const rest = markdown.slice(startIdx);
+    const nextLabel = /^\s*(?:##\s+|[A-Za-z][A-Za-z /-]*:\s*$)/m.exec(rest);
+    const endIdx = nextLabel ? nextLabel.index : rest.length;
+    const inline = (labelMatch[1] || "").trim();
+    const block = rest.slice(0, endIdx).trim();
+    const content = [inline, block].filter(Boolean).join("\n").trim();
+    if (content) return content;
+  }
+
+  return "";
 }
 
 function truncateNotepad(content, maxChars) {

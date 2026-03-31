@@ -387,6 +387,23 @@ const tools = [
       const taskSession = state.task_sessions[args.task_key];
       if (!taskSession) return { error: `Unknown task: ${args.task_key}` };
 
+      if (taskSession.status !== "in-progress") {
+        return {
+          error: `Cannot process handoff for ${args.task_key} because task is ${taskSession.status}. Dispatch it first.`,
+          task_key: args.task_key,
+          task_status: taskSession.status,
+          current_task: state.current_task,
+        };
+      }
+
+      if (state.current_task && state.current_task !== args.task_key) {
+        return {
+          error: `Cannot process handoff for ${args.task_key} while ${state.current_task} is current in-progress task.`,
+          task_key: args.task_key,
+          current_task: state.current_task,
+        };
+      }
+
       const parsed = parseHandoffFromWorkerOutput(args.worker_output);
       if (!parsed) {
         markTaskFailed(
@@ -400,9 +417,11 @@ const tools = [
           status: "failed",
           reason: "No handoff block found in worker output",
           task_key: args.task_key,
-          attempts: taskSession.attempts,
-          max_attempts: taskSession.max_attempts,
-          can_retry: taskSession.attempts < taskSession.max_attempts,
+          attempts: state.task_sessions[args.task_key].attempts,
+          max_attempts: state.task_sessions[args.task_key].max_attempts,
+          can_retry:
+            state.task_sessions[args.task_key].attempts <
+            state.task_sessions[args.task_key].max_attempts,
         };
       }
 
@@ -479,7 +498,9 @@ const tools = [
           task_key: args.task_key,
           reason: parsed.blocked_issues,
           summary: compressedSummary,
-          can_retry: taskSession.attempts < taskSession.max_attempts,
+          can_retry:
+            state.task_sessions[args.task_key].attempts <
+            state.task_sessions[args.task_key].max_attempts,
           next_task: nextKey,
         };
       }

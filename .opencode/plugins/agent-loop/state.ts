@@ -384,29 +384,28 @@ export function parseTodos(planContent: string): PlanTask[] {
 
   const todoRegex = /^- \[[ x]\]\s*(?:(\d+)\.\s*)?(.+)$/gm;
   let match: RegExpExecArray | null;
-  const rawTodos: { index: number; title: string; startPos: number }[] = [];
+  const rawTodos: { index: number; title: string; lineStart: number; bodyStart: number }[] = [];
 
   while ((match = todoRegex.exec(todoSection)) !== null) {
     const idx = match[1] ? parseInt(match[1], 10) : rawTodos.length + 1;
     rawTodos.push({
       index: idx,
       title: match[2].trim(),
-      startPos: match.index + match[0].length,
+      lineStart: match.index,
+      bodyStart: todoRegex.lastIndex,
     });
   }
 
   for (let i = 0; i < rawTodos.length; i++) {
-    const start = rawTodos[i].startPos;
-    const end = i + 1 < rawTodos.length
-      ? todoSection.lastIndexOf("\n- [", rawTodos[i + 1].startPos)
-      : todoSection.length;
+    const start = rawTodos[i].bodyStart;
+    const end = i + 1 < rawTodos.length ? rawTodos[i + 1].lineStart : todoSection.length;
     const body = todoSection.slice(start, end).trim();
 
     const task: PlanTask = {
       index: rawTodos[i].index,
       key: `todo:${rawTodos[i].index}`,
       title: rawTodos[i].title,
-      description: body,
+      description: body || rawTodos[i].title,
       acceptance_criteria: extractBoldSection(body, "Acceptance Criteria"),
       references: extractBoldSection(body, "References"),
       must_not_do: extractBoldSection(body, "Must NOT do"),

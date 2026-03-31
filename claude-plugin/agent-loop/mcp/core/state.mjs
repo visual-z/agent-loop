@@ -312,23 +312,21 @@ export function parseTodos(planContent) {
     rawTodos.push({
       index: idx,
       title: match[2].trim(),
-      startPos: match.index + match[0].length,
+      lineStart: match.index,
+      bodyStart: todoRegex.lastIndex,
     });
   }
 
   for (let i = 0; i < rawTodos.length; i += 1) {
-    const start = rawTodos[i].startPos;
-    const end =
-      i + 1 < rawTodos.length
-        ? todoSection.lastIndexOf("\n- [", rawTodos[i + 1].startPos)
-        : todoSection.length;
+    const start = rawTodos[i].bodyStart;
+    const end = i + 1 < rawTodos.length ? rawTodos[i + 1].lineStart : todoSection.length;
     const body = todoSection.slice(start, end).trim();
 
     tasks.push({
       index: rawTodos[i].index,
       key: `todo:${rawTodos[i].index}`,
       title: rawTodos[i].title,
-      description: body,
+      description: body || rawTodos[i].title,
       acceptance_criteria: extractBoldSection(body, "Acceptance Criteria"),
       references: extractBoldSection(body, "References"),
       must_not_do: extractBoldSection(body, "Must NOT do"),
