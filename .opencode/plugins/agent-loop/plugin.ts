@@ -254,6 +254,22 @@ export const AgentLoopPlugin = async ({
     });
   }
 
+  async function injectSessionPrompt(
+    targetSessionId: string,
+    text: string,
+    noReply = false
+  ): Promise<void> {
+    const body = {
+      parts: [{ type: "text", text }],
+      ...(noReply ? { noReply: true } : {}),
+    };
+
+    await client.session.prompt({
+      path: targetSessionId,
+      body,
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Helper: Load full task context for dispatch
   // ---------------------------------------------------------------------------
@@ -448,21 +464,13 @@ export const AgentLoopPlugin = async ({
           if (orchestratorSessionId || runtime.session_id) {
             const targetSessionId = orchestratorSessionId || runtime.session_id;
             try {
-              await client.session.prompt({
-                path: { id: targetSessionId },
-                body: {
-                  parts: [
-                    {
-                      type: "text",
-                      text:
-                        "## Agent Loop — Session Recycle Required\n\n" +
-                        `Session context pressure reached ${Math.round(sessionPressure * 100)}%.\n` +
-                        `Please save progress now and continue in a fresh session using agent_loop_resume.\n` +
-                        "Do not dispatch a new worker in this session.",
-                    },
-                  ],
-                },
-              });
+              await injectSessionPrompt(
+                targetSessionId,
+                "## Agent Loop — Session Recycle Required\n\n" +
+                  `Session context pressure reached ${Math.round(sessionPressure * 100)}%.\n` +
+                  "Please save progress now and continue in a fresh session using agent_loop_resume.\n" +
+                  "Do not dispatch a new worker in this session."
+              );
             } catch {
               // best effort
             }
@@ -537,12 +545,7 @@ export const AgentLoopPlugin = async ({
           }
 
           try {
-            await client.session.prompt({
-              path: { id: targetSessionId },
-              body: {
-                parts: [{ type: "text", text: prompt }],
-              },
-            });
+            await injectSessionPrompt(targetSessionId, prompt);
 
             orchestratorSessionId = targetSessionId;
 

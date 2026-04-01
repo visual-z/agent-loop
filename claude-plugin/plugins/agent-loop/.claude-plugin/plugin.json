@@ -1,7 +1,7 @@
 {
   "name": "agent-loop",
   "description": "Agent Loop orchestration for Claude Code with MCP tools, orchestrator/worker agents, and runtime guard hooks.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "author": {
     "name": "visual",
     "email": "visual_zyh@foxmail.com"
