@@ -160,7 +160,14 @@ const sourceEntryPath = join(sourcePluginsDir, "agent-loop.ts");
 const sourceModuleDir = join(sourcePluginsDir, "agent-loop");
 const sourceAgentsDir = join(repoRoot, ".opencode", "agents");
 const sourceCommandsDir = join(repoRoot, ".opencode", "commands");
-const agentFiles = ["agent-loop-orchestrator.md", "agent-loop-worker.md"];
+const legacyAgentFiles = ["monkey-test.md"];
+const agentFiles = [
+  "agent-loop-orchestrator.md",
+  "agent-loop-worker.md",
+  "agent-test-orchestrator.md",
+  "monkey-test-page-tester.md",
+  "monkey-test-report-reviewer.md",
+];
 const commandFiles = ["agent-loop.md"];
 
 const opencodeConfigDir =
@@ -175,9 +182,8 @@ if (args.command === "status") {
   const states: Array<[string, boolean]> = [
     [targetEntryPath, existsSync(targetEntryPath)],
     [targetModuleDir, existsSync(targetModuleDir)],
-    [join(globalAgentsDir, agentFiles[0]), existsSync(join(globalAgentsDir, agentFiles[0]))],
-    [join(globalAgentsDir, agentFiles[1]), existsSync(join(globalAgentsDir, agentFiles[1]))],
-    [join(globalCommandsDir, commandFiles[0]), existsSync(join(globalCommandsDir, commandFiles[0]))],
+    ...agentFiles.map((file) => [join(globalAgentsDir, file), existsSync(join(globalAgentsDir, file))] as [string, boolean]),
+    ...commandFiles.map((file) => [join(globalCommandsDir, file), existsSync(join(globalCommandsDir, file))] as [string, boolean]),
   ];
 
   log(`OpenCode config dir: ${opencodeConfigDir}`);
@@ -191,6 +197,9 @@ if (args.command === "uninstall") {
   rmSync(targetModuleDir, { recursive: true, force: true });
   rmSync(targetEntryPath, { force: true });
   for (const file of agentFiles) {
+    rmSync(join(globalAgentsDir, file), { force: true });
+  }
+  for (const file of legacyAgentFiles) {
     rmSync(join(globalAgentsDir, file), { force: true });
   }
   for (const file of commandFiles) {
@@ -239,6 +248,10 @@ for (const file of commandFiles) {
 mkdirSync(globalPluginsDir, { recursive: true });
 mkdirSync(globalAgentsDir, { recursive: true });
 mkdirSync(globalCommandsDir, { recursive: true });
+
+for (const file of legacyAgentFiles) {
+  rmSync(join(globalAgentsDir, file), { force: true });
+}
 
 rmSync(targetModuleDir, { recursive: true, force: true });
 cpSync(sourceModuleDir, targetModuleDir, { recursive: true, force: true });
