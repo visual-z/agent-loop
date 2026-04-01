@@ -1,11 +1,11 @@
 import { existsSync } from "fs";
 import { readdir, readFile } from "fs/promises";
-import { join, resolve } from "path";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
-function candidateRoots(workdir) {
-  const configured = process.env.AGENT_LOOP_WORKER_CATALOG_PATH?.trim();
-  const roots = [configured, join(workdir, "agency-agents"), resolve(workdir, "..", "agency-agents")].filter(Boolean);
-  return [...new Set(roots)].filter((root) => existsSync(root));
+function vendoredRoot() {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  return join(moduleDir, "..", "hidden-workers", "agency-agents");
 }
 
 async function walkMarkdownFiles(root) {
@@ -38,7 +38,10 @@ function parseFrontmatter(raw) {
 }
 
 export async function loadWorkerCatalog(workdir) {
-  const roots = candidateRoots(workdir);
+  void workdir;
+
+  const root = vendoredRoot();
+  const roots = existsSync(root) ? [root] : [];
   const workers = new Map();
 
   for (const root of roots) {

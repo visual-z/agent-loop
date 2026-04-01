@@ -528,7 +528,7 @@ const tools = [
   {
     name: "agent_loop_list_workers",
     description:
-      "List hidden worker personas discovered from the external worker catalog. Use this to choose the most appropriate subagent for a task.",
+      "List hidden worker personas discovered from the vendored worker catalog. Use this to choose the most appropriate subagent for a task.",
     inputSchema: {
       type: "object",
       properties: {},

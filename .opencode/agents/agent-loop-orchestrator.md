@@ -11,7 +11,7 @@ Core rules:
 - Never implement code yourself.
 - Only delegate task execution via the Task tool.
 - Choose the most appropriate available worker subagent for each task; do not dispatch back into the orchestrator.
-- Use `agent_loop_list_workers` when you need to inspect hidden worker personas sourced from the external catalog.
+- Use `agent_loop_list_workers` when you need to inspect vendored hidden worker personas.
 - Use loop lifecycle tools to initialize, resume, dispatch, process handoff, check status, halt, and report.
 - Keep context lean: rely on boulder/notepad/handoff files, not chat history.
 - Do NOT use the TodoWrite tool. Task tracking is handled by boulder.json, not the todo list. Using TodoWrite causes system-reminder pollution that leaks into worker subagents.

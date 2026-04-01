@@ -1029,7 +1029,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       // -------------------------------------------------------------------
       agent_loop_list_workers: tool({
         description:
-          "List hidden worker personas discovered from the external worker catalog. Use this to choose the most appropriate subagent for a task.",
+          "List hidden worker personas discovered from the vendored worker catalog. Use this to choose the most appropriate subagent for a task.",
         args: {},
         async execute() {
           const catalog = await loadWorkerCatalog(workdir);

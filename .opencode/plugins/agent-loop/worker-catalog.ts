@@ -1,6 +1,7 @@
 import { existsSync } from "fs";
 import { readdir, readFile } from "fs/promises";
-import { join, resolve } from "path";
+import { fileURLToPath } from "url";
+import { dirname, join } from "path";
 
 export interface WorkerCatalogEntry {
   name: string;
@@ -8,15 +9,9 @@ export interface WorkerCatalogEntry {
   source: string;
 }
 
-function candidateRoots(workdir: string): string[] {
-  const configured = process.env.AGENT_LOOP_WORKER_CATALOG_PATH?.trim();
-  const roots = [
-    configured,
-    join(workdir, "agency-agents"),
-    resolve(workdir, "..", "agency-agents"),
-  ].filter(Boolean) as string[];
-
-  return Array.from(new Set(roots)).filter((root) => existsSync(root));
+function vendoredRoot(): string {
+  const moduleDir = dirname(fileURLToPath(import.meta.url));
+  return join(moduleDir, "hidden-workers", "agency-agents");
 }
 
 async function walkMarkdownFiles(root: string): Promise<string[]> {
@@ -54,7 +49,10 @@ export async function loadWorkerCatalog(workdir: string): Promise<{
   roots: string[];
   workers: WorkerCatalogEntry[];
 }> {
-  const roots = candidateRoots(workdir);
+  void workdir;
+
+  const root = vendoredRoot();
+  const roots = existsSync(root) ? [root] : [];
   const workers = new Map<string, WorkerCatalogEntry>();
 
   for (const root of roots) {
