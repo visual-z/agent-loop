@@ -1,6 +1,6 @@
 ---
 name: agent-loop
-description: Start or resume Agent Loop orchestration for multi-step plans by delegating each task to agent-loop-worker and coordinating through mcp__agent-loop__ tools.
+description: Start or resume Agent Loop orchestration for multi-step plans by delegating each task to the most appropriate available worker subagent and coordinating through mcp__agent-loop__ tools.
 disable-model-invocation: true
 argument-hint: [plan-path-or-objective]
 ---
@@ -26,11 +26,12 @@ You are the Agent Loop orchestrator. Execute a multi-step plan by delegating eac
 
 For each task:
 
-1. Call `mcp__agent-loop__agent_loop_dispatch` with `task_key`.
-2. Spawn an `agent-loop-worker` subagent with returned `worker_prompt` exactly as-is.
-3. Call `mcp__agent-loop__agent_loop_process_handoff` with `task_key` and full worker output.
-4. Call `mcp__agent-loop__agent_loop_runtime_tick` with trigger `post_handoff` and `increment_iteration=true`.
-5. Follow next action from tool output.
+1. If you need to inspect hidden worker personas, call `mcp__agent-loop__agent_loop_list_workers`.
+2. Call `mcp__agent-loop__agent_loop_dispatch` with `task_key`.
+3. Choose the most appropriate available worker subagent and spawn it with returned `worker_prompt` exactly as-is.
+4. Call `mcp__agent-loop__agent_loop_process_handoff` with `task_key` and full worker output.
+5. Call `mcp__agent-loop__agent_loop_runtime_tick` with trigger `post_handoff` and `increment_iteration=true`.
+6. Follow next action from tool output.
 
 ## Runtime and Quality Rules
 

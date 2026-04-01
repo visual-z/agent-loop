@@ -3,7 +3,7 @@ export function buildWorkerPrompt(payload) {
 
   sections.push(`# Task Assignment
 
-You are a focused coding worker. Complete the task below, then write a handoff summary.
+Complete the task below, then write a handoff summary.
 
 ## CONSTRAINTS
 - Complete ONLY the task described below. Do not expand scope.
@@ -107,7 +107,7 @@ status: done|failed|blocked
 (List of files created, modified, or deleted. Write "None" if no file changes.)
 
 ## Test Results
-(Output of verification/tests)
+(Output of verification, if any)
 
 ## Final Response (Optional)
 (If this task is message-only, write the exact user-facing result here.)

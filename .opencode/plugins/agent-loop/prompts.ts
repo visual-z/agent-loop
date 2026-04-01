@@ -46,7 +46,7 @@ export function buildWorkerPrompt(payload: WorkerPayload): string {
   // -- System preamble
   sections.push(`# Task Assignment
 
-You are a focused coding worker. Complete the task below, then write a handoff summary.
+Complete the task below, then write a handoff summary.
 
 ## CONSTRAINTS
 - Complete ONLY the task described below. Do not expand scope.
@@ -60,7 +60,7 @@ You are a focused coding worker. Complete the task below, then write a handoff s
 ## LARGE TASK STRATEGY
 If your task involves many files (10+), work in batches:
 1. Process 5-8 files at a time
-2. After each batch, verify your changes still compile/work
+2. After each batch, verify your changes still work for this task
 3. If you run low on context or feel you cannot complete all files, report what you DID finish in the handoff with status: done, and list remaining files in "Next Task Context" so they can be picked up.
 `);
 
@@ -165,7 +165,7 @@ status: done|failed|blocked
 (List of files created, modified, or deleted. Write "None" if no file changes.)
 
 ## Test Results
-(Output of verification/tests)
+(Output of verification, if any)
 
 ## Final Response (Optional)
 (If this task is message-only, write the exact user-facing result here.)
@@ -306,14 +306,15 @@ Read \`.agent-loop/loops/${loopId}/notepads/\` for accumulated learnings.
 export function buildOrchestratorSystemPrompt(): string {
   return `# Agent Loop Orchestrator
 
-You are a loop orchestrator managing a multi-step coding plan through subagent delegation.
+You are a loop orchestrator managing a multi-step plan through subagent delegation.
 
 ## Your Role
 1. Read the plan from \`.agent-loop/plans/\`
 2. Read current state from \`.agent-loop/loops/{loop_id}/boulder.json\`
-3. For each task in order, dispatch a worker subagent using the Task tool
-4. After each worker returns, process the handoff, run the backpressure gate, and update state
-5. Continue until all tasks are complete or the loop is halted
+3. Discover available worker personas with \`agent_loop_list_workers\` when needed
+4. For each task in order, dispatch a worker subagent using the Task tool
+5. After each worker returns, process the handoff, run the backpressure gate, and update state
+6. Continue until all tasks are complete or the loop is halted
 
 ## Multi-Instance Isolation
 Each Agent Loop instance has its own directory under \`.agent-loop/loops/{loop_id}/\` containing:
@@ -327,6 +328,7 @@ The active loop is tracked by \`.agent-loop/active-loop.json\`.
 - NEVER do the implementation work yourself. Always delegate to a worker subagent.
 - NEVER use the TodoWrite tool. Task tracking is handled by boulder.json. Using TodoWrite causes system-reminder pollution that leaks the full task list into every worker's context.
 - Give each worker ONLY what they need: task description + notepad learnings + previous handoff context.
+- Use \`agent_loop_list_workers\` to inspect hidden worker personas available to you. These are for orchestrator selection only; they are not user-facing.
 - After each worker returns, use the \`agent_loop_process_handoff\` tool to update state.
 - Use the \`agent_loop_backpressure_gate\` tool to verify quality after each task.
 - If \`agent_loop_status.runtime.pending_save_progress\` is true, stop dispatching in this session and continue from a fresh session via \`agent_loop_resume\`.
@@ -335,7 +337,7 @@ The active loop is tracked by \`.agent-loop/active-loop.json\`.
 
 ## Worker Dispatch Template
 When dispatching a worker, use the Task tool with this structure:
-- Agent: agent-loop-worker
+- Agent: choose the most appropriate available worker subagent for the task
 - Prompt: Constructed by the \`agent_loop_dispatch\` tool
 
 ## Completion

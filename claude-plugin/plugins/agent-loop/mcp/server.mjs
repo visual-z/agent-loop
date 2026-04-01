@@ -67,6 +67,7 @@ import {
   formatGateResult,
   getBackpressureShellCommand,
 } from "./core/gate.mjs";
+import { loadWorkerCatalog } from "./core/worker-catalog.mjs";
 
 const workdir = resolve(process.env.AGENT_LOOP_WORKDIR || process.cwd());
 
@@ -520,7 +521,25 @@ const tools = [
         task_title: taskSession.task_title,
         worker_prompt: workerPrompt,
         instructions:
-          "Dispatch this prompt to agent-loop-worker subagent. After worker returns, call agent_loop_process_handoff with full worker output.",
+          "Choose the most appropriate available worker subagent for this task and dispatch this prompt to it. After worker returns, call agent_loop_process_handoff with full worker output.",
+      };
+    },
+  },
+  {
+    name: "agent_loop_list_workers",
+    description:
+      "List hidden worker personas discovered from the external worker catalog. Use this to choose the most appropriate subagent for a task.",
+    inputSchema: {
+      type: "object",
+      properties: {},
+      additionalProperties: false,
+    },
+    async execute() {
+      const catalog = await loadWorkerCatalog(workdir);
+      return {
+        catalog_roots: catalog.roots,
+        count: catalog.workers.length,
+        workers: catalog.workers,
       };
     },
   },
@@ -914,7 +933,7 @@ const tools = [
   },
   {
     name: "agent_loop_backpressure_gate",
-    description: "Run backpressure gate manually and return formatted results.",
+      description: "Run the backpressure verification gate manually and return formatted results.",
     inputSchema: {
       type: "object",
       properties: {},

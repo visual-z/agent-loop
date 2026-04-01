@@ -27,11 +27,12 @@ $ARGUMENTS
 
 For each task:
 
-1. Call `agent_loop_dispatch` with the task_key -> it returns a `worker_prompt`
-2. Use the **Task tool** to dispatch an `agent-loop-worker` subagent with the `worker_prompt` as the task description
-3. When the worker returns, call `agent_loop_process_handoff` with the task_key and the worker's full output
-4. The tool will run the backpressure gate and return the next action
-5. Follow the `next_action` field - it tells you what to do next
+1. If you need to choose a specialist, call `agent_loop_list_workers` to inspect hidden worker personas available to the orchestrator
+2. Call `agent_loop_dispatch` with the task_key -> it returns a `worker_prompt`
+3. Use the **Task tool** to dispatch the most appropriate available subagent with the `worker_prompt` as the task description
+4. When the worker returns, call `agent_loop_process_handoff` with the task_key and the worker's full output
+5. The tool will run the backpressure gate and return the next action
+6. Follow the `next_action` field - it tells you what to do next
 
 ## Rules
 - NEVER implement code yourself. Always delegate to workers.

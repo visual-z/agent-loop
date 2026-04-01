@@ -116,7 +116,7 @@ if (runtime?.pending_save_progress && toolName === "Agent") {
 const blockedMutationTools = new Set(["Bash", "Edit", "Write", "NotebookEdit", "PowerShell"]);
 if (blockedMutationTools.has(toolName)) {
   deny(
-    `Agent Loop policy violation: orchestrator cannot call ${toolName}. Delegate implementation through agent-loop-worker.`
+    `Agent Loop policy violation: orchestrator cannot call ${toolName}. Delegate implementation through an appropriate worker subagent.`
   );
   process.exit(0);
 }
@@ -130,10 +130,16 @@ if (toolName === "Agent") {
     toolInput.name ||
     null;
 
-  const allowed = new Set(["agent-loop-worker", "agent-loop:agent-loop-worker"]);
-  if (!target || !allowed.has(target)) {
+  const forbidden = new Set(["agent-loop-orchestrator", "agent-loop:agent-loop-orchestrator"]);
+  if (!target) {
     deny(
-      `Agent Loop policy violation: orchestrator may only dispatch agent-loop-worker, received: ${target || "(missing)"}`
+      "Agent Loop policy violation: orchestrator must target a worker subagent explicitly."
+    );
+    process.exit(0);
+  }
+  if (forbidden.has(target)) {
+    deny(
+      `Agent Loop policy violation: orchestrator may not dispatch itself, received: ${target}`
     );
     process.exit(0);
   }

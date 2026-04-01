@@ -79,6 +79,7 @@ import {
   formatGateResult,
   getBackpressureShellCommand,
 } from "./gate";
+import { loadWorkerCatalog } from "./worker-catalog";
 
 // =============================================================================
 // Plugin Export
@@ -130,8 +131,6 @@ export const AgentLoopPlugin = async ({
     "apply_patch",
     "multiedit",
   ]);
-
-  const WORKER_AGENT_NAMES = new Set(["agent-loop-worker"]);
 
   const isTerminalLoopStatus = (status: BoulderState["status"]) =>
     status === "completed" || status === "halted" || status === "failed";
@@ -645,7 +644,7 @@ export const AgentLoopPlugin = async ({
       if (ORCHESTRATOR_MUTATION_TOOLS.has(toolName)) {
         throw new Error(
           `Agent Loop policy violation: orchestrator cannot call ${toolName}. ` +
-            `Delegate implementation through Task -> agent-loop-worker.`
+            `Delegate implementation through the Task tool to an appropriate worker subagent.`
         );
       }
 
@@ -656,13 +655,16 @@ export const AgentLoopPlugin = async ({
 
         if (!targetAgent) {
           throw new Error(
-            "Agent Loop policy violation: Task calls from orchestrator must target agent-loop-worker explicitly."
+            "Agent Loop policy violation: Task calls from orchestrator must target a worker subagent explicitly."
           );
         }
 
-        if (!WORKER_AGENT_NAMES.has(targetAgent)) {
+        if (
+          targetAgent === "agent-loop-orchestrator" ||
+          targetAgent === "agent-loop:agent-loop-orchestrator"
+        ) {
           throw new Error(
-            `Agent Loop policy violation: orchestrator may only dispatch agent-loop-worker, received: ${targetAgent}`
+            `Agent Loop policy violation: orchestrator may not dispatch itself, received: ${targetAgent}`
           );
         }
       }
@@ -922,7 +924,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       // agent_loop_dispatch — Build the worker prompt and dispatch
       // -------------------------------------------------------------------
       agent_loop_dispatch: tool({
-        description: `Prepare the worker prompt for a specific task. Returns the constructed prompt that should be passed to an agent-loop-worker subagent via the Task tool. The prompt contains ONLY what the worker needs: task description, notepad learnings, previous handoff context, and relevant file paths. This ensures true context isolation.`,
+        description: `Prepare the worker prompt for a specific task. Returns the constructed prompt that should be passed to the worker subagent chosen by the orchestrator. The prompt contains ONLY what the worker needs: task description, notepad learnings, previous handoff context, and relevant file paths. This ensures true context isolation.`,
         args: {
           task_key: tool.schema
             .string()
@@ -1017,7 +1019,24 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             task_title: taskSession.task_title,
             worker_prompt: workerPrompt,
             instructions:
-              `Dispatch this to an agent-loop-worker subagent using the Task tool. Pass the worker_prompt as the task prompt. Do NOT add any additional context — the prompt is self-contained. After the worker returns, call agent_loop_process_handoff with the worker's output.`,
+              `Choose the most appropriate available worker subagent for this task, then dispatch it using the Task tool with worker_prompt as the task prompt. Do NOT add any additional context — the prompt is self-contained. After the worker returns, call agent_loop_process_handoff with the worker's output.`,
+          });
+        },
+      }),
+
+      // -------------------------------------------------------------------
+      // agent_loop_list_workers — List hidden worker personas for orchestrator
+      // -------------------------------------------------------------------
+      agent_loop_list_workers: tool({
+        description:
+          "List hidden worker personas discovered from the external worker catalog. Use this to choose the most appropriate subagent for a task.",
+        args: {},
+        async execute() {
+          const catalog = await loadWorkerCatalog(workdir);
+          return JSON.stringify({
+            catalog_roots: catalog.roots,
+            count: catalog.workers.length,
+            workers: catalog.workers,
           });
         },
       }),
@@ -1457,7 +1476,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       // -------------------------------------------------------------------
       agent_loop_backpressure_gate: tool({
         description:
-          "Run the backpressure quality gate (build + test + lint) and return results.",
+          "Run the backpressure verification gate and return results.",
         args: {},
         async execute(args, context) {
           const result = await runBackpressureGate(runShell, workdir);
