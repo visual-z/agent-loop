@@ -1,6 +1,6 @@
 {
   "name": "@agent-loop/agent-loop-opencode",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "description": "One-command OpenCode installer for Agent Loop",
   "packageManager": "bun@1.3.10",

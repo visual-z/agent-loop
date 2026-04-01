@@ -161,11 +161,14 @@ status: done|failed|blocked
 ## Key Decisions
 (Any architectural or implementation decisions you made and why)
 
-## Files Changed
-(List of files created, modified, or deleted)
+## Files Changed (Optional)
+(List of files created, modified, or deleted. Write "None" if no file changes.)
 
 ## Test Results
 (Output of verification/tests)
+
+## Final Response (Optional)
+(If this task is message-only, write the exact user-facing result here.)
 
 ## Learnings for Next Tasks
 (Patterns, conventions, or gotchas the next worker should know)
@@ -383,15 +386,23 @@ export function parseHandoffFromWorkerOutput(output: string): {
   files_changed: string;
   test_results: string;
   learnings: string;
+  final_response: string;
   blocked_issues: string;
   next_task_context: string;
-} | null {
+} {
   const match = output.match(/HANDOFF_START\n([\s\S]*?)HANDOFF_END/);
-  if (!match) return null;
-
-  const block = match[1];
+  const block = match ? match[1] : output;
   const statusMatch = block.match(/^status:\s*(.+)$/im);
-  const status = normalizeStatus(statusMatch?.[1]);
+  const status = normalizeStatus(statusMatch?.[1], output);
+
+  const finalResponse =
+    extractHandoffSection(block, [
+      "Final Response",
+      "User-Facing Result",
+      "User Response",
+      "Result",
+    ]) ||
+    (!match ? output.trim().slice(0, 4000) : "");
 
   return {
     status,
@@ -404,6 +415,7 @@ export function parseHandoffFromWorkerOutput(output: string): {
       "Learnings for Future Tasks",
       "Learnings",
     ]),
+    final_response: finalResponse,
     blocked_issues: extractHandoffSection(block, [
       "Blocked / Known Issues",
       "Blocked Issues",
@@ -413,9 +425,16 @@ export function parseHandoffFromWorkerOutput(output: string): {
   };
 }
 
-function normalizeStatus(raw: string | undefined): "done" | "failed" | "blocked" {
-  const value = (raw || "done").trim().toLowerCase();
+function normalizeStatus(
+  raw: string | undefined,
+  sourceText = ""
+): "done" | "failed" | "blocked" {
+  const value = (raw || "").trim().toLowerCase();
   if (value === "failed" || value === "blocked") return value;
+
+  const text = sourceText.toLowerCase();
+  if (/\bstatus\s*:\s*blocked\b/.test(text)) return "blocked";
+  if (/\bstatus\s*:\s*failed\b/.test(text)) return "failed";
   return "done";
 }
 

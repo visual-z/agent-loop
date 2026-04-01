@@ -532,7 +532,11 @@ const tools = [
       type: "object",
       properties: {
         task_key: { type: "string" },
-        worker_output: { type: "string" },
+        worker_output: {
+          type: "string",
+          description:
+            "Worker output text. HANDOFF_START...HANDOFF_END is preferred but plain result text is accepted.",
+        },
         skip_gate: { type: "boolean" },
       },
       required: ["task_key", "worker_output"],
@@ -567,25 +571,6 @@ const tools = [
       }
 
       const parsed = parseHandoffFromWorkerOutput(args.worker_output);
-      if (!parsed) {
-        markTaskFailed(
-          state,
-          args.task_key,
-          "Worker did not produce HANDOFF_START...HANDOFF_END block."
-        );
-        await writeBoulder(workdir, activeLoopId, state);
-
-        return {
-          status: "failed",
-          reason: "No handoff block found in worker output",
-          task_key: args.task_key,
-          attempts: state.task_sessions[args.task_key].attempts,
-          max_attempts: state.task_sessions[args.task_key].max_attempts,
-          can_retry:
-            state.task_sessions[args.task_key].attempts <
-            state.task_sessions[args.task_key].max_attempts,
-        };
-      }
 
       const sanitize = (text, maxChars) => (text || "").trim().slice(0, maxChars);
       const compressedSummary = [
@@ -594,6 +579,7 @@ const tools = [
         parsed.key_decisions ? `Decisions: ${sanitize(parsed.key_decisions, 600)}` : "",
         parsed.files_changed ? `Files: ${sanitize(parsed.files_changed, 500)}` : "",
         parsed.test_results ? `Tests: ${sanitize(parsed.test_results, 400)}` : "",
+        parsed.final_response ? `Response: ${sanitize(parsed.final_response, 500)}` : "",
         parsed.blocked_issues && parsed.blocked_issues !== "None"
           ? `Issues: ${sanitize(parsed.blocked_issues, 400)}`
           : "",
@@ -1258,7 +1244,7 @@ const tools = [
 const server = new Server(
   {
     name: "agent-loop",
-    version: "0.2.0",
+    version: "0.2.1",
   },
   {
     capabilities: {

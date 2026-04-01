@@ -1030,7 +1030,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             .describe("The task key that was just completed"),
           worker_output: tool.schema
             .string()
-            .describe("The full output/response from the worker subagent (must contain HANDOFF_START...HANDOFF_END block)"),
+            .describe("The full output/response from the worker subagent (HANDOFF block preferred, plain result text also accepted)"),
           skip_gate: tool.schema
             .boolean()
             .describe("Skip the backpressure gate (use only if gate is known to be irrelevant)")
@@ -1071,31 +1071,6 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           // Parse the handoff from worker output
           const parsed = parseHandoffFromWorkerOutput(args.worker_output);
 
-          if (!parsed) {
-            markTaskFailed(
-              state,
-              args.task_key,
-              "Worker did not produce a HANDOFF_START...HANDOFF_END block."
-            );
-            await writeBoulder(workdir, activeLoopId, state);
-
-            return JSON.stringify({
-              status: "failed",
-              reason: "No handoff block found in worker output",
-              task_key: args.task_key,
-              attempts: state.task_sessions[args.task_key].attempts,
-              max_attempts: state.task_sessions[args.task_key].max_attempts,
-              can_retry:
-                state.task_sessions[args.task_key].attempts <
-                state.task_sessions[args.task_key].max_attempts,
-              next_action:
-                state.task_sessions[args.task_key].attempts <
-                state.task_sessions[args.task_key].max_attempts
-                  ? `Retry: call agent_loop_dispatch with task_key "${args.task_key}"`
-                  : `Task blocked. Call agent_loop_dispatch with the next available task.`,
-            });
-          }
-
           const sanitize = (text: string, maxChars: number) =>
             (text || "").trim().slice(0, maxChars);
 
@@ -1105,6 +1080,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             parsed.key_decisions ? `Decisions: ${sanitize(parsed.key_decisions, 600)}` : "",
             parsed.files_changed ? `Files: ${sanitize(parsed.files_changed, 500)}` : "",
             parsed.test_results ? `Tests: ${sanitize(parsed.test_results, 400)}` : "",
+            parsed.final_response ? `Response: ${sanitize(parsed.final_response, 500)}` : "",
             parsed.blocked_issues && parsed.blocked_issues !== "None"
               ? `Issues: ${sanitize(parsed.blocked_issues, 400)}`
               : "",

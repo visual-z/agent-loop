@@ -640,6 +640,9 @@ ${handoff.test_results}
 ## Learnings for Next Tasks
 ${handoff.learnings}
 
+## Final Response
+${handoff.final_response}
+
 ## Blocked / Known Issues
 ${handoff.blocked_issues}
 
@@ -699,6 +702,7 @@ function parseHandoff(raw) {
     files_changed: extractSection(body, "Files Changed"),
     test_results: extractSection(body, "Test Results"),
     learnings: extractSection(body, "Learnings for Next Tasks"),
+    final_response: extractSection(body, "Final Response"),
     blocked_issues: extractSection(body, "Blocked / Known Issues"),
     next_task_context: extractSection(body, "Next Task Context"),
   };

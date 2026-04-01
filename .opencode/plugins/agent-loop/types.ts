@@ -137,6 +137,7 @@ export interface HandoffFile {
   files_changed: string;
   test_results: string;
   learnings: string;
+  final_response: string;
   blocked_issues: string;
   next_task_context: string;
 }
