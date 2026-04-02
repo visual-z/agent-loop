@@ -3,6 +3,7 @@
     "agent-loop": {
       "command": "bun",
       "args": [
+        "--install=auto",
         "${CLAUDE_PLUGIN_ROOT}/mcp/server.mjs"
       ]
     }
