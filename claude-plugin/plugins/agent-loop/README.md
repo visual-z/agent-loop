@@ -14,10 +14,11 @@ If your setup requires namespaced commands:
 
 This plugin provides:
 
-- `agent-loop-orchestrator` (primary agent)
-- `agent-loop-worker` (hidden subagent)
+- `agent-loop-orchestrator` (visible agent)
+- `agent-test-orchestrator` (visible agent)
 - MCP lifecycle tools (`agent_loop_*`)
 - Runtime guard hooks and session continuity hooks
+- Internal MonkeyTest prompt/reference assets used by the visible agents
 
 Maintainer validation:
 
