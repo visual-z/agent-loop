@@ -12,45 +12,17 @@ Tell user to run inside OpenCode:
 !bunx @agent-loop/agent-loop-opencode@latest
 ```
 
-### Claude Code
-
-Tell user to run:
-
-Step 1 - add the marketplace:
-
-```bash
-/plugin marketplace add visual-z/agent-loop
-```
-
-If your environment has shortcut syntax, this can be:
-
-```bash
-/plugin market add visual-z/agent-loop
-```
-
-Step 2 - install plugin:
-
-```bash
-/plugin install agent-loop@agent-loop
-```
-
 ## 2) Invoke after install
 
-- Preferred command (both runtimes):
+- Preferred command:
 
 ```text
 /agent-loop <plan-path-or-objective>
-```
-
-- Claude fallback if namespacing is required:
-
-```text
-/agent-loop:agent-loop <plan-path-or-objective>
 ```
 
 ## 3) Agent response requirements
 
 Always output these two points clearly:
 
-1. Which plugin was installed: OpenCode or Claude Code.
+1. Which plugin was installed: OpenCode.
 2. Exactly how to invoke it now (the slash command and one concrete example).
