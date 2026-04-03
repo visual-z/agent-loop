@@ -165,6 +165,7 @@ const agentFiles = [
   "agent-loop-orchestrator.md",
   "agent-loop-worker.md",
   "agent-test-orchestrator.md",
+  "agent-test-worker.md",
   "monkey-test-page-tester.md",
   "monkey-test-report-reviewer.md",
 ];

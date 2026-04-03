@@ -73,29 +73,21 @@ Once the plan is initialized or resumed, follow the normal Agent Loop cycle:
 2. Call `mcp__agent-loop__agent_loop_resume` or use the loop returned by init.
 3. For each next task:
    - call `mcp__agent-loop__agent_loop_dispatch(task_key)`
-   - choose an appropriate available worker subagent by task title:
-     - `Test Route:` -> use a capable browser-testing subagent and instruct it to follow the MonkeyTest page tester role defined by:
-       - `monkey-test/prompts/page-tester-template.md`
-       - `monkey-test/reference/screenshot-protocol.md`
-       - `monkey-test/reference/testing-reference.md`
-       - `monkey-test/reference/report-format.md`
-     - `Review Route:` -> use a capable review subagent and instruct it to follow the MonkeyTest report reviewer role defined by:
-       - `monkey-test/prompts/report-reviewer-template.md`
-       - `monkey-test/reference/bug-report-format.md`
-       - `monkey-test/reference/report-format.md`
-     - `Generate MonkeyTest Final Report` -> use a capable general-purpose worker subagent
-   - pass `worker_prompt` exactly as returned, plus only the minimal MonkeyTest role instructions relevant to that task
+   - use a capable available worker subagent and instruct it to follow the internal `monkey-test/prompts/agent-test-worker.md` role
+   - for `Test Route:` tasks, tell the worker to default to `agent-browser` and only fall back if it is unavailable
+   - pass `worker_prompt` exactly as returned, plus only the minimal Agent Test role instructions relevant to that task
    - after the worker returns, call `mcp__agent-loop__agent_loop_process_handoff` with `skip_gate: true`
-   - update `.monkey-test-state.json` to mirror the finished task
    - call `mcp__agent-loop__agent_loop_runtime_tick` with `trigger: "post_handoff"` and `increment_iteration: true`
 4. Respect recycle and save-progress signals exactly like normal Agent Loop.
 
-## Worker Selection Rules
-- Testing tasks should go to a worker capable of browser-based UI exploration.
-- Review tasks should go to a worker capable of screenshot and report analysis.
-- Final summary should go to a capable general-purpose worker.
+## State Ownership Rules
+- The worker that completes a task must update `.monkey-test-state.json` before returning.
+- You do not edit or write the state file during the execution loop.
 
-The MonkeyTest tester/reviewer roles are internal prompt resources, not user-visible plugin agents.
+## Worker Selection Rules
+- Use one capable available worker subagent per task.
+- The worker must follow `monkey-test/prompts/agent-test-worker.md`.
+- For browser testing, `agent-browser` is the default and preferred tool.
 
 ## Final Behavior Contract
 When the user switches to `agent-test-orchestrator`, the behavior should feel like the original MonkeyTest workflow, but the loop itself must be powered by the existing Agent Loop runtime instead of a second bespoke loop.
