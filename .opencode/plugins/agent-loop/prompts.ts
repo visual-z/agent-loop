@@ -42,6 +42,10 @@ import type {
  */
 export function buildWorkerPrompt(payload: WorkerPayload): string {
   const sections: string[] = [];
+  const isAgentTestTask =
+    payload.task.title.startsWith("Test Route:") ||
+    payload.task.title.startsWith("Review Route:") ||
+    payload.task.title === "Generate MonkeyTest Final Report";
 
   // -- System preamble
   sections.push(`# Task Assignment
@@ -138,6 +142,20 @@ Before declaring the task complete, run:
 ${payload.backpressure_command}
 \`\`\`
 Include the results in your handoff.
+`);
+  }
+
+  if (isAgentTestTask) {
+    sections.push(`## Agent Test Execution Rules
+- You are executing this task as \`agent-test-worker\`.
+- You MUST update \`.monkey-test-state.json\` yourself before returning.
+- The orchestrator will NOT edit or write the MonkeyTest state file for you.
+- For \`Test Route:\` tasks, default to \`agent-browser\` for browser automation.
+- Only fall back to another built-in browser automation tool if \`agent-browser\` is genuinely unavailable.
+- Do NOT create ad hoc Playwright, Puppeteer, or Selenium scripts unless the task explicitly requires it.
+- Do NOT install browser frameworks or browser binaries unless the task explicitly requires it.
+- For \`Review Route:\` tasks, do not open a browser; use screenshots and the route report.
+- For \`Generate MonkeyTest Final Report\`, aggregate existing MonkeyTest outputs and update final state.
 `);
   }
 

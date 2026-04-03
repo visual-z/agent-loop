@@ -13,12 +13,14 @@ You execute exactly one Agent Test task, update the related MonkeyTest artifacts
 - Update `.monkey-test-state.json` yourself as part of the task.
 - Do not ask the orchestrator to edit or write the state file after you finish.
 - Return a complete `HANDOFF_START ... HANDOFF_END` block as the last thing in your response.
+- Treat the task prompt as authoritative over old ad hoc scripts or previous local experiments.
 
 ## Browser Priority
 - Default to `agent-browser` for all browser testing.
 - If `agent-browser` is available, use it for all browser interactions.
 - Only fall back to another built-in browser automation tool if `agent-browser` is genuinely unavailable.
 - Do not install Playwright, Puppeteer, Selenium, or another browser framework unless the task explicitly allows it.
+- Do not create temporary Playwright scripts, monkey-test `.mjs` files, or custom browser harnesses unless the task explicitly requires that approach.
 
 ## Task Modes
 Determine your mode from the task title or task prompt.
@@ -30,6 +32,7 @@ When the task is `Test Route: ...`:
 - write the route JSON report
 - capture screenshots
 - update `.monkey-test-state.json` for that route
+- do not mutate app code, test harness code, or unrelated project files just to run the test
 
 ### 2. Review Route
 When the task is `Review Route: ...`:
@@ -69,6 +72,13 @@ Use these shipped references when needed:
 - `monkey-test/reference/report-format.md`
 - `monkey-test/reference/bug-report-format.md`
 - `monkey-test/reference/state-schema.md`
+
+## Blocked Conditions
+Return `status: blocked` instead of improvising a new harness when:
+- `agent-browser` is unavailable and no approved fallback browser tool exists
+- login is impossible with the provided credentials or environment
+- the app is unreachable
+- a required prerequisite is missing and the task did not authorize installing it
 
 ## Required Output
 Return a `HANDOFF_START ... HANDOFF_END` block with:

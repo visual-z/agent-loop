@@ -1008,6 +1008,10 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           // Build the worker payload
           const payload = await buildPayloadForTask(activeLoopId, state, task);
           const workerPrompt = buildWorkerPrompt(payload);
+          const isAgentTestTask =
+            task.title.startsWith("Test Route:") ||
+            task.title.startsWith("Review Route:") ||
+            task.title === "Generate MonkeyTest Final Report";
 
           // Mark task as started
           markTaskStarted(state, args.task_key);
@@ -1017,9 +1021,12 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             action: "dispatch",
             task_key: args.task_key,
             task_title: taskSession.task_title,
+            worker_agent: isAgentTestTask ? "agent-test-worker" : undefined,
             worker_prompt: workerPrompt,
             instructions:
-              `Choose the most appropriate available worker subagent for this task, then dispatch it using the Task tool with worker_prompt as the task prompt. Do NOT add any additional context — the prompt is self-contained. After the worker returns, call agent_loop_process_handoff with the worker's output.`,
+              isAgentTestTask
+                ? `Dispatch this task to \`agent-test-worker\` using the Task tool. Pass worker_prompt exactly as the task prompt. Do NOT add any additional context. After the worker returns, call agent_loop_process_handoff with the worker's output.`
+                : `Choose the most appropriate available worker subagent for this task, then dispatch it using the Task tool with worker_prompt as the task prompt. Do NOT add any additional context — the prompt is self-contained. After the worker returns, call agent_loop_process_handoff with the worker's output.`,
           });
         },
       }),
