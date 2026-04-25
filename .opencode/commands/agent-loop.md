@@ -27,7 +27,7 @@ $ARGUMENTS
       1. Call `agent_loop_propose_plan` with `plan_name` and `objective`.
       2. Dispatch `agent-loop-plan-architect` via the Task tool with the returned `worker_prompt`. Pass the prompt verbatim.
       3. Inspect the architect's final response:
-         - **`CLARIFY_REQUEST`** → extract its `## Questions` and **invoke the `Question` tool** (note capital Q, see schema in the orchestrator agent prompt) with one entry per question, including options + descriptions. Do NOT print as markdown. **STOP and wait**. When the user replies, call `agent_loop_record_clarifications(plan_path, qa_pairs)`. Re-dispatch the architect with the returned prompt; go back to step 3.
+         - **`CLARIFY_REQUEST`** → extract its `## Questions` and **invoke the `question` tool** with one entry per question, including `question`, `header`, and `options` with `{label, description}`. Do NOT print as markdown. **STOP and wait**. When the user replies, call `agent_loop_record_clarifications(plan_path, qa_pairs)`. Re-dispatch the architect with the returned prompt; go back to step 3.
          - **`PLAN_WRITTEN`** → go to step 4. Do NOT request approval.
       4. Send the user a 3–5 line info summary: title, TODO count, parallel structure. Do NOT ask "approve / edit / regenerate". Do NOT wait.
       5. Call `agent_loop_init(plan_path)` (auto_approve defaults to true). Begin execution immediately.

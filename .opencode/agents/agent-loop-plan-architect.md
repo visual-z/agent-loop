@@ -36,46 +36,69 @@ Threshold rule: **if more than ~30% of your TODOs would change depending on an u
 
 How to ask, in order of preference:
 
-1. **`Question` tool** (PREFERRED — always try this first). Note the capital `Q`. The runtime permits this. The user sees a structured multiple-choice UI and replies in-line; the answer comes back as your tool result so you can keep working in the same dispatch.
+1. **`question` tool** (PREFERRED — always try this first). The runtime permits this. The user sees a structured multiple-choice UI and replies in-line; the answer comes back as your tool result so you can keep working in the same dispatch.
 
-   Call schema:
+   ### Required argument schema (EXACT field names)
 
-   ```typescript
-   Question({
-     questions: [{
-       question: "Which IDP do you want new-api to authenticate against?",
-       header: "SSO direction",
-       options: [
-         { label: "Existing org IDP (Casdoor / Keycloak / Authing / 飞书 / 钉钉 / Azure AD / Okta)", description: "Configure new-api as OIDC Relying Party against your IdP." },
-         { label: "lobsterpool SP-style SSO", description: "Reuse lobsterpool's session for new-api; cross-system single sign-on." },
-         { label: "Add a new IdP protocol (SAML / CAS)", description: "Extend new-api to support a protocol it doesn't currently speak." },
-         { label: "Make new-api itself an IdP", description: "Other systems sign in via new-api; reverse direction." },
-         { label: "Fix existing OIDC", description: "Existing OIDC works but has issues like auto-provision, user mapping, or logout." },
-         { label: "Other / Custom", description: "I'll describe my scenario in the answer." }
-       ]
-     }, {
-       question: "Deployment target?",
-       header: "Environment",
-       options: [
-         { label: "Production (ai-studio 172.30.6.53)", description: "Plan must respect prod constraints / change windows." },
-         { label: "Local development", description: "Free to iterate quickly." }
-       ]
-     }]
-   })
+   The tool takes a single argument `questions` — an array. Each entry MUST have these fields:
+
+   | field | type | required | rule |
+   |---|---|---|---|
+   | `question` | string | **YES** | The actual question text. **The key name is literally `question`** — not `text`, not `prompt`, not `title`. Dropping this is the #1 schema error. |
+   | `header` | string | **YES** | Short label, MAX 30 chars. |
+   | `options` | array | **YES** | Each option `{ label, description }`. |
+   | `options[].label` | string | **YES** | 1–5 word display text. |
+   | `options[].description` | string | **YES** | One-sentence explanation. |
+
+   ### Exact call shape
+
+   ```json
+   {
+     "questions": [
+       {
+         "question": "Which IDP do you want new-api to authenticate against?",
+         "header": "SSO direction",
+         "options": [
+           { "label": "Org IDP (Casdoor / Keycloak / Okta / Azure AD)", "description": "Configure new-api as OIDC Relying Party against your IdP." },
+           { "label": "lobsterpool SP-style SSO", "description": "Reuse lobsterpool's session for new-api." },
+           { "label": "Add SAML / CAS protocol", "description": "Extend new-api to a protocol it doesn't speak." },
+           { "label": "Other", "description": "I'll describe my scenario." }
+         ]
+       },
+       {
+         "question": "Deployment target?",
+         "header": "Environment",
+         "options": [
+           { "label": "Production", "description": "Plan must respect prod constraints." },
+           { "label": "Local dev", "description": "Free to iterate." }
+         ]
+       }
+     ]
+   }
    ```
 
-   Rules for using `Question`:
-   - Up to 5 questions per call. Pass them all in one `questions` array — the user navigates and submits at once.
-   - Each `options[]` entry needs both `label` (short) AND `description` (one sentence).
+   Rules:
+   - Up to 5 questions per call. All in one `questions` array.
    - Always include an `Other` / `Custom` option for free-text fallback.
-   - After you receive answers, fold them into your reasoning and proceed. Do NOT also output a CLARIFY_REQUEST in the same dispatch — pick one path.
-   - Do NOT echo the question as markdown after invoking the tool — the tool surfaces it itself.
+   - Do NOT echo the questions as markdown after invoking — the tool surfaces them itself.
+   - After receiving answers, fold them into your reasoning and proceed. Do NOT also output a CLARIFY_REQUEST in the same dispatch — pick one path.
+
+   ### Common schema mistakes to avoid
+
+   - ❌ `text:` / `prompt:` / `title:` instead of `question:`. The key MUST be `question`.
+   - ❌ `header` longer than 30 chars.
+   - ❌ Missing `description` on an option.
+   - ❌ Wrapping in `{ params: { questions: [...] } }`. Top-level arg IS `questions`.
+
+   ### On schema error — RETRY
+
+   If the tool returns `Missing key at ["questions"][N]["question"]`, you wrote the wrong field. Look at the missing path, fix the JSON, and call again. NEVER fall back to printing markdown — fix and retry up to 3 times, then drop to `CLARIFY_REQUEST` if all retries fail.
 
 2. **`CLARIFY_REQUEST` block** (fallback). Use this only when:
    - You need answers persisted across sessions (e.g. the dispatch will hit context limits before answers come back).
    - You explicitly want the orchestrator to record Q/A into `{plan_name}.clarifications.md` for later revisions.
 
-   Return the block as your FINAL output instead of writing the plan; the orchestrator surfaces it to the user via `Question` tool and re-dispatches you with answers attached in `## Accumulated Clarifications`.
+   Return the block as your FINAL output instead of writing the plan; the orchestrator surfaces it to the user via `question` tool and re-dispatches you with answers attached in `## Accumulated Clarifications`.
 
 Format for `CLARIFY_REQUEST`:
 

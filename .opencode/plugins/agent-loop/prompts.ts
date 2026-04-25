@@ -281,38 +281,63 @@ Rule: **if more than ~30% of your TODOs would change depending on an unknown ans
 
 How to ask, in order of preference:
 
-**1. PREFERRED — call the \`Question\` tool directly** (note capital \`Q\`). The runtime permits this. The user sees a structured multiple-choice UI and answers come back to YOU in this same dispatch.
+**1. PREFERRED — call the \`question\` tool directly**. The runtime permits this. The user sees a structured multiple-choice UI and answers come back to YOU in this same dispatch.
 
-Exact call schema:
+### Required argument schema (EXACT field names — get this wrong and the tool throws SchemaError)
 
-\`\`\`typescript
-Question({
-  questions: [{
-    question: "Which IDP do you want new-api to authenticate against?",
-    header: "SSO direction",
-    options: [
-      { label: "Existing org IDP (Casdoor / Keycloak / Okta / Azure AD)", description: "Configure new-api as OIDC Relying Party against your IdP." },
-      { label: "lobsterpool SP-style SSO", description: "Reuse lobsterpool's session for new-api." },
-      { label: "Add SAML / CAS protocol support", description: "Extend new-api to a protocol it doesn't currently speak." },
-      { label: "Other / Custom", description: "I'll describe my scenario." }
-    ]
-  }, {
-    question: "Deployment environment?",
-    header: "Target",
-    options: [
-      { label: "Production", description: "Plan must respect prod constraints." },
-      { label: "Local dev", description: "Free to iterate." }
-    ]
-  }]
-})
+The tool takes a single argument \`questions\` — an array. Each entry MUST have these fields:
+
+| field | type | required | rule |
+|---|---|---|---|
+| \`question\` | string | **YES** | The actual question text. **The key MUST be literally \`question\`** — not \`text\`/\`prompt\`/\`title\`. Dropping this is the #1 schema error. |
+| \`header\` | string | **YES** | Short label, MAX 30 chars. |
+| \`options\` | array | **YES** | Each option \`{ label, description }\`. |
+| \`options[].label\` | string | **YES** | 1–5 word display text. |
+| \`options[].description\` | string | **YES** | One-sentence explanation. |
+
+### Exact call shape (JSON)
+
+\`\`\`json
+{
+  "questions": [
+    {
+      "question": "Which IDP do you want new-api to authenticate against?",
+      "header": "SSO direction",
+      "options": [
+        { "label": "Org IDP (Casdoor / Keycloak / Okta / Azure AD)", "description": "Configure new-api as OIDC Relying Party against your IdP." },
+        { "label": "lobsterpool SP-style SSO", "description": "Reuse lobsterpool's session for new-api." },
+        { "label": "Add SAML / CAS protocol", "description": "Extend new-api to a protocol it doesn't speak." },
+        { "label": "Other", "description": "I'll describe my scenario." }
+      ]
+    },
+    {
+      "question": "Deployment environment?",
+      "header": "Target",
+      "options": [
+        { "label": "Production", "description": "Plan must respect prod constraints." },
+        { "label": "Local dev", "description": "Free to iterate." }
+      ]
+    }
+  ]
+}
 \`\`\`
 
-Rules for the \`Question\` tool:
-- Up to 5 questions per call. Pass them all in one \`questions\` array.
-- Every \`options[]\` entry needs both \`label\` AND \`description\`.
+Rules:
+- Up to 5 questions per call. All in one \`questions\` array.
 - Always include an \`Other\` / \`Custom\` option for free-text fallback.
 - Do NOT echo the questions as markdown after invoking — the tool itself surfaces them.
 - After receiving answers, fold them into your reasoning and proceed (write the plan or ask follow-ups).
+
+### Common schema mistakes
+
+- ❌ \`text:\` / \`prompt:\` / \`title:\` instead of \`question:\`. The key MUST be \`question\`.
+- ❌ \`header\` longer than 30 chars.
+- ❌ Missing \`description\` on an option.
+- ❌ Wrapping in an extra \`{ params: {...} }\` layer.
+
+### On schema error — RETRY
+
+If the tool returns \`Missing key at ["questions"][N]["question"]\`, you wrote the wrong field. Look at the path, fix the JSON, call again. NEVER fall back to printing markdown — fix and retry up to 3 times, then drop to \`CLARIFY_REQUEST\` if all retries fail.
 
 **2. FALLBACK — emit a \`CLARIFY_REQUEST\` block**. Use this only when you need answers persisted to disk for cross-session continuity (rare). Format:
 
@@ -332,7 +357,7 @@ revision: ${p.revision}
 (Cap at 5. Multiple-choice phrasing. No yes/no taste questions.)
 \`\`\`
 
-Do NOT write the plan file in the same response as a \`CLARIFY_REQUEST\`. Pick ONE: \`Question\` tool, \`CLARIFY_REQUEST\` block, or \`PLAN_WRITTEN\`.
+Do NOT write the plan file in the same response as a \`CLARIFY_REQUEST\`. Pick ONE: \`question\` tool, \`CLARIFY_REQUEST\` block, or \`PLAN_WRITTEN\`.
 
 When clarifications are already provided in this prompt (see "Accumulated Clarifications" below), you must NOT re-ask the same question — the user already answered it.
 
@@ -414,7 +439,7 @@ ${p.accumulated_clarifications.trim()}
 
 Choose ONE final mode:
 
-**Path A — call \`Question\` tool now**: invoke \`Question({...})\` mid-dispatch. Answers come back to YOU in this same task; continue reasoning and either write the plan (Path C) or ask more questions. This is preferred for short interactive interviews.
+**Path A — call the \`question\` tool now**: invoke the tool with \`{"questions":[...]}\` mid-dispatch. Answers come back to YOU in this same task; continue reasoning and either write the plan (Path C) or ask more questions. This is preferred for short interactive interviews.
 
 **Path B — emit \`CLARIFY_REQUEST\`**: end the dispatch with a \`CLARIFY_REQUEST\` block. Used when answers must be persisted across sessions or you want them recorded into \`{plan_name}.clarifications.md\` for later revisions.
 
@@ -427,14 +452,14 @@ revision: ${p.revision}
 todo_count: <N>
 \`\`\`
 
-Pick exactly one terminal mode per dispatch. Path A may loop multiple Question calls before transitioning to Path C.
+Pick exactly one terminal mode per dispatch. Path A may loop through multiple \`question\` tool calls before transitioning to Path C.
 
 The orchestrator handles each terminal:
 - Path C → orchestrator calls \`agent_loop_init\` (auto-approve by default).
-- Path B → orchestrator surfaces questions to user via \`Question\` tool and calls \`agent_loop_record_clarifications\`.
+- Path B → orchestrator surfaces questions to user via the \`question\` tool and calls \`agent_loop_record_clarifications\`.
 - Path A → no orchestrator action needed; you handled it inline.
 
-Revision does NOT bump for Question / CLARIFY rounds — only when the user explicitly edits/regenerates an existing draft.
+Revision does NOT bump for \`question\` / CLARIFY rounds — only when the user explicitly edits/regenerates an existing draft.
 `);
 
   return sections.join("\n");

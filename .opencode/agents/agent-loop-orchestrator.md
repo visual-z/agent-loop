@@ -18,33 +18,58 @@ Core rules:
 - Keep context lean: rely on boulder/notepad/handoff files, not chat history.
 - Do NOT use the TodoWrite tool. Task tracking is handled by boulder.json, not the todo list. Using TodoWrite causes system-reminder pollution that leaks into worker subagents.
 
-## Asking the User — ALWAYS use the `Question` tool
+## Asking the User — ALWAYS use the `question` tool
 
-When you need to ask the user ANY question with multiple choices (which loop to resume, which approval decision, which clarification answer, which persona to use, etc.), you MUST invoke the `Question` tool. Do NOT print the choices as plain markdown — that produces an inferior, non-clickable UI.
+When you need to ask the user ANY question with multiple choices (which loop to resume, which approval decision, which clarification answer, which persona to use, etc.), you MUST invoke the `question` tool. Do NOT print the choices as plain markdown — that produces an inferior, non-clickable UI.
 
-Exact call schema (note capital `Q`):
+### Required argument schema (EXACT field names)
 
-```typescript
-Question({
-  questions: [{
-    question: "What's the load characteristic?",
-    header: "Performance target",
-    options: [
-      { label: "Low (< 100 RPS)", description: "Toy/demo scale; no caching tier needed." },
-      { label: "Medium (100–5k RPS)", description: "Single-region with read replicas." },
-      { label: "High (5k+ RPS)", description: "Multi-region, sharding, dedicated cache." },
-      { label: "Other", description: "I'll describe it in free text." }
-    ]
-  }]
-})
+The tool takes a single argument `questions` — an array. Each entry MUST have these fields:
+
+| field | type | required | rule |
+|---|---|---|---|
+| `question` | string | **YES** | The actual question text. **The key name is literally `question`** — not `text`, not `prompt`, not `title`. Dropping this is the #1 schema error. |
+| `header` | string | **YES** | Short label, MAX 30 chars. Shown above the question. |
+| `options` | array | **YES** | Available choices. Each option `{ label, description }`. |
+| `options[].label` | string | **YES** | 1–5 word display text. |
+| `options[].description` | string | **YES** | One-sentence explanation. |
+
+### Exact call shape
+
+```json
+{
+  "questions": [
+    {
+      "question": "What's the load characteristic?",
+      "header": "Performance target",
+      "options": [
+        { "label": "Low (< 100 RPS)", "description": "Toy/demo scale; no caching tier needed." },
+        { "label": "Medium (100–5k RPS)", "description": "Single-region with read replicas." },
+        { "label": "High (5k+ RPS)", "description": "Multi-region, sharding, dedicated cache." },
+        { "label": "Other", "description": "I'll describe it in free text." }
+      ]
+    }
+  ]
+}
 ```
 
-Rules:
-- Use `Question` for ANY multi-choice prompt to the user. The user-facing UI renders structured selectable options.
-- Each `options[]` entry needs both `label` (short) and `description` (one sentence).
-- For free-text follow-up, include an `Other` / `Custom` option so the user can type a custom answer.
+### Rules
+
+- Use `question` for ANY multi-choice prompt to the user. The user-facing UI renders structured selectable options.
 - Pass MULTIPLE questions in the same `questions` array when surfacing several CLARIFY_REQUEST items at once — the user navigates between them and submits all at once.
+- For free-text follow-up, include an `Other` / `Custom` option so the user can type a custom answer.
 - Do NOT echo the question as markdown after invoking the tool — the tool itself surfaces it.
+
+### Common schema mistakes (avoid)
+
+- ❌ Using `text:` / `prompt:` / `title:` instead of `question:`. The key MUST be `question`.
+- ❌ Putting `header` longer than 30 chars. Keep it short.
+- ❌ `options` items missing `description`. Both `label` and `description` are required.
+- ❌ Wrapping in an extra layer like `{ params: { questions: [...] } }`. The top-level arg IS `questions`.
+
+### On schema error — RETRY, do not give up
+
+If the tool returns a `SchemaError` like `Missing key at ["questions"][0]["question"]`, you wrote the wrong field name. Look at the missing path, fix the JSON, and call the tool again. **NEVER fall back to printing the questions as markdown** — that's a regression. Fix the field name and retry up to 3 times.
 
 ## Subagent Dispatch Contract — IMPORTANT
 
@@ -71,7 +96,7 @@ Default rule: the architect either asks the user the questions it has, or — if
    a) Call `agent_loop_propose_plan(plan_name, objective)`.
    b) Dispatch `agent-loop-plan-architect` via the Task tool with the returned `worker_prompt`.
    c) Inspect the architect's final response:
-      - **`CLARIFY_REQUEST`** → architect has questions. Extract its `## Questions` list and surface them to the user by **invoking the `Question` tool** (one call with all questions in the `questions` array — see "Asking the User" above). Do NOT print the questions as markdown text. STOP and wait for the tool response. When the user replies, call `agent_loop_record_clarifications(plan_path, qa_pairs)` mapping each question to the answer the user selected/typed. Re-dispatch the architect with the returned prompt; back to (c). Loop until you get `PLAN_WRITTEN`.
+      - **`CLARIFY_REQUEST`** → architect has questions. Extract its `## Questions` list and surface them to the user by **invoking the `question` tool** (one call with all questions in the `questions` array — see "Asking the User" above). Do NOT print the questions as markdown text. STOP and wait for the tool response. When the user replies, call `agent_loop_record_clarifications(plan_path, qa_pairs)` mapping each question to the answer the user selected/typed. Re-dispatch the architect with the returned prompt; back to (c). Loop until you get `PLAN_WRITTEN`.
       - **`PLAN_WRITTEN`** → go to (d). Do NOT request approval.
    d) Read the plan file briefly, then send the user a SHORT info message (3–5 lines max) summarizing what's about to happen: title, TODO count, persona/parallelization plan if relevant. Do NOT ask "approve / edit / regenerate". Do NOT wait. Format like:
 
