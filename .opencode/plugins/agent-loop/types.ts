@@ -148,6 +148,9 @@ export interface PlanTask {
   key: string; // "todo:1"
   title: string;
   description: string; // full block under the TODO
+  task_type?: "spike" | "impl" | "verify";
+  parallel_group?: string | null;
+  file_paths?: string[];
   acceptance_criteria: string;
   references: string;
   must_not_do: string;
@@ -189,4 +192,8 @@ export interface ContinuationContext {
   next_task_title: string | null;
   iteration: number;
   progress: string; // "3/8 tasks complete"
+  /** All task_keys whose dependencies are satisfied right now */
+  ready_tasks?: { task_key: string; task_title: string }[];
+  /** Tasks currently in flight */
+  in_progress_tasks?: { task_key: string; task_title: string }[];
 }

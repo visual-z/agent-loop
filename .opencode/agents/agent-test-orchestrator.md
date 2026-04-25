@@ -88,7 +88,7 @@ Once the plan is initialized or resumed, follow the normal Agent Loop cycle:
 3. For each next task:
    - call `agent_loop_dispatch(task_key)`
    - dispatch `agent-test-worker`
-   - pass `worker_prompt` exactly as returned
+   - pass `task_prompt` exactly as returned
    - after the worker returns, call `agent_loop_process_handoff` with `skip_gate: true`
    - call `agent_loop_runtime_tick` with `trigger: "post_handoff"` and `increment_iteration: true`
 4. Respect `session_recycle_required` and `pending_save_progress` exactly like normal Agent Loop.

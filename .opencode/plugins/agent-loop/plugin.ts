@@ -24,7 +24,7 @@
 import { writeFile } from "fs/promises";
 import { existsSync } from "fs";
 import { spawn } from "child_process";
-import { join } from "path";
+import { join, basename } from "path";
 import { createHash } from "crypto";
 import { tool } from "@opencode-ai/plugin";
 
@@ -49,12 +49,15 @@ import {
   markTaskFailed,
   markTaskBlocked,
   pickNextTask,
+  pickReadyTasks,
+  inProgressTaskKeys,
   isLoopComplete,
   shouldHalt,
   parsePlan,
   readHandoff,
   readLatestHandoff,
   writeHandoff,
+  writeWorkerPrompt,
   readNotepad,
   appendNotepad,
   loopDir,
@@ -65,12 +68,20 @@ import {
   writeActiveLoopPointer,
   clearActiveLoopPointer,
   migrateOldLayout,
+  readPlanFrontmatter,
+  stampPlanApproved,
+  appendPlanFeedback,
+  readPlanFeedback,
+  readPlanContent,
+  appendPlanClarifications,
+  readPlanClarifications,
 } from "./state";
 
 import {
   buildWorkerPrompt,
   buildContinuationPrompt,
   buildCompactionContext,
+  buildPlanArchitectPrompt,
   parseHandoffFromWorkerOutput,
 } from "./prompts";
 
@@ -79,7 +90,11 @@ import {
   formatGateResult,
   getBackpressureShellCommand,
 } from "./gate";
-import { loadWorkerCatalog } from "./worker-catalog";
+import {
+  loadWorkerCatalog,
+  getPersonaBody,
+  type WorkerCatalogEntry,
+} from "./worker-catalog";
 
 // =============================================================================
 // Plugin Export
@@ -108,6 +123,9 @@ export const AgentLoopPlugin = async ({
   /** The currently active loop ID (= plan name) */
   let activeLoopId: string | null = null;
 
+  /** Most recent terminal loop, kept so completion_report works after cleanup */
+  let lastTerminalLoopId: string | null = null;
+
   /** Whether we're actively in a loop iteration */
   let loopActive = false;
 
@@ -132,6 +150,19 @@ export const AgentLoopPlugin = async ({
     "multiedit",
   ]);
 
+  /**
+   * The exhaustive list of subagent IDs the orchestrator is allowed to
+   * dispatch. Personas are NOT here — they are injected as prompt prefixes
+   * into `agent-loop-worker`, not dispatched as separate subagents.
+   */
+  const ALLOWED_DISPATCH_TARGETS = new Set([
+    "agent-loop-worker",
+    "agent-loop-plan-architect",
+    "agent-test-worker",
+    "monkey-test-page-tester",
+    "monkey-test-report-reviewer",
+  ]);
+
   const isTerminalLoopStatus = (status: BoulderState["status"]) =>
     status === "completed" || status === "halted" || status === "failed";
 
@@ -140,6 +171,7 @@ export const AgentLoopPlugin = async ({
     status: BoulderState["status"]
   ): Promise<void> {
     if (!loopId || !isTerminalLoopStatus(status)) return;
+    lastTerminalLoopId = loopId;
     await clearActiveLoopPointer(workdir);
     if (activeLoopId === loopId) {
       activeLoopId = null;
@@ -304,7 +336,12 @@ export const AgentLoopPlugin = async ({
     }
 
     // Extract relevant file paths from task description
-    const filePaths = extractFilePaths(task.description);
+    const filePaths =
+      task.file_paths && task.file_paths.length > 0
+        ? task.file_paths
+        : extractFilePaths(
+            `${task.description}\n${task.acceptance_criteria}\n${task.references}`
+          );
 
     // Project conventions from learnings (first 500 chars)
     const conventions = learnings.slice(0, 500);
@@ -484,7 +521,9 @@ export const AgentLoopPlugin = async ({
 
         // Auto-continue: inject continuation prompt into orchestrator
         if (orchestratorSessionId || runtime.session_id) {
-          const nextKey = pickNextTask(state);
+          const readyKeys = pickReadyTasks(state, 8);
+          const inFlight = inProgressTaskKeys(state);
+          const nextKey = readyKeys[0] ?? null;
           const nextSession = nextKey ? state.task_sessions[nextKey] : null;
           const latestHandoff = await readLatestHandoff(workdir, activeLoopId);
 
@@ -514,13 +553,21 @@ export const AgentLoopPlugin = async ({
             next_task_title: nextSession?.task_title || null,
             iteration: state.iteration,
             progress: `${doneTasks.length}/${state.stats.total_tasks} tasks complete`,
+            ready_tasks: readyKeys.map((k) => ({
+              task_key: k,
+              task_title: state.task_sessions[k]?.task_title ?? "",
+            })),
+            in_progress_tasks: inFlight.map((k) => ({
+              task_key: k,
+              task_title: state.task_sessions[k]?.task_title ?? "",
+            })),
           };
 
           if (latestHandoff) {
             ctx.handoff_summary = latestHandoff.what_was_done;
           }
 
-          if (!nextKey) {
+          if (!nextKey && inFlight.length === 0) {
             if (isLoopComplete(state)) {
               state.status = "completed";
             } else {
@@ -612,10 +659,13 @@ export const AgentLoopPlugin = async ({
 
     // =========================================================================
     // tool.execute.before — Hard guardrails for orchestrator behavior
+    //
+    // The orchestrator is forbidden from calling mutation tools at ALL TIMES,
+    // not just when a loop is active. The plan-architect subagent is the only
+    // path to writing files (via the Task tool). This is the structural cure
+    // for the "orchestrator keeps trying to Write/Edit" failure mode.
     // =========================================================================
     "tool.execute.before": async (input: any, output: any) => {
-      if (!activeLoopId) return;
-
       const toolName = input?.tool || input?.name;
       if (!toolName) return;
 
@@ -623,32 +673,66 @@ export const AgentLoopPlugin = async ({
         getSessionIdFromEvent(input) ||
         getSessionIdFromEvent(output) ||
         null;
-      if (!sessionId) return;
 
-      const state = await readBoulder(workdir, activeLoopId);
-      if (!state) return;
-
-      if (
-        state.status === "completed" ||
-        state.status === "halted" ||
-        state.status === "failed"
-      ) {
-        return;
+      // Identify the orchestrator session through any signal we have:
+      //   1. cached in-memory orchestratorSessionId (set on init/resume/session.created)
+      //   2. boulder.json's bound orchestrator_session_id (cross-session continuity)
+      let boundSessionId = orchestratorSessionId;
+      if (!boundSessionId && activeLoopId) {
+        const state = await readBoulder(workdir, activeLoopId);
+        boundSessionId = state?.orchestrator_session_id || null;
       }
 
-      const boundSessionId = orchestratorSessionId || state.orchestrator_session_id;
-      if (!boundSessionId || sessionId !== boundSessionId) {
-        return;
-      }
+      const isOrchestratorCall =
+        Boolean(boundSessionId) && sessionId === boundSessionId;
 
-      if (ORCHESTRATOR_MUTATION_TOOLS.has(toolName)) {
+      // If we're certain this is the orchestrator session, never let it mutate.
+      if (isOrchestratorCall && ORCHESTRATOR_MUTATION_TOOLS.has(toolName)) {
         throw new Error(
           `Agent Loop policy violation: orchestrator cannot call ${toolName}. ` +
-            `Delegate implementation through the Task tool to an appropriate worker subagent.`
+            `Delegate to a worker via the Task tool. For plan files specifically, ` +
+            `dispatch \`agent-loop-plan-architect\`.`
         );
       }
 
-      if (toolName === "task") {
+      // Sandbox: any write/edit/patch from any session must land inside the
+      // project workdir. Catches subagent typos (relative paths from a wrong
+      // cwd) and accidental writes to ~ or /tmp. Bash mutations are not
+      // intercepted here — those go through the orchestrator deny + per-agent
+      // permission config.
+      if (toolName === "write" || toolName === "edit" || toolName === "patch" || toolName === "multiedit") {
+        const args = output?.args || input?.args || {};
+        const target =
+          args.filePath ||
+          args.file_path ||
+          args.path ||
+          args.target ||
+          (Array.isArray(args.edits) && args.edits[0]?.filePath) ||
+          null;
+        if (typeof target === "string" && target.length > 0) {
+          const resolved = target.startsWith("/")
+            ? target
+            : join(workdir, target);
+          // Reject paths that escape workdir via prefix mismatch or `..`.
+          const normalizedWork = workdir.replace(/\/+$/, "");
+          const normalizedTarget = resolved.replace(/\/+$/, "");
+          const escapes =
+            !normalizedTarget.startsWith(normalizedWork + "/") &&
+            normalizedTarget !== normalizedWork;
+          if (escapes) {
+            throw new Error(
+              `Agent Loop sandbox violation: ${toolName} target "${target}" resolves to "${resolved}" which is OUTSIDE the project workdir "${workdir}". ` +
+                `All file mutation must stay inside the project. If you intended a project-relative path, ensure it does not start with "/" or "..".`
+            );
+          }
+        }
+      }
+
+      // Defense in depth: if the call originates from the orchestrator
+      // session, prevent orchestrator from dispatching itself or any agent
+      // outside the known whitelist. Personas are NOT dispatched directly —
+      // they are injected as prompt prefixes into `agent-loop-worker`.
+      if (isOrchestratorCall && toolName === "task") {
         const args = output?.args || input?.args || {};
         const targetAgent =
           args.subagent_type || args.agent || args.subagent || args.name || null;
@@ -667,6 +751,15 @@ export const AgentLoopPlugin = async ({
             `Agent Loop policy violation: orchestrator may not dispatch itself, received: ${targetAgent}`
           );
         }
+
+        const normalized = String(targetAgent).replace(/^agent-loop:/, "");
+        if (!ALLOWED_DISPATCH_TARGETS.has(normalized)) {
+          throw new Error(
+            `Agent Loop policy violation: subagent_type "${targetAgent}" is not in the allowlist. ` +
+              `Allowed targets: ${[...ALLOWED_DISPATCH_TARGETS].join(", ")}. ` +
+              `For specialist execution, dispatch \`agent-loop-worker\` and pass \`persona_id\` to \`agent_loop_dispatch\` — personas are prompt prefixes, not OpenCode agents.`
+          );
+        }
       }
     },
 
@@ -675,13 +768,294 @@ export const AgentLoopPlugin = async ({
     // =========================================================================
     tool: {
       // -------------------------------------------------------------------
+      // agent_loop_propose_plan — Hand off plan authoring to plan-architect
+      // -------------------------------------------------------------------
+      agent_loop_propose_plan: tool({
+        description: `Start (or revise) a plan via the agent-loop-plan-architect subagent. The orchestrator MUST NOT write the plan itself — call this tool, then dispatch agent-loop-plan-architect with the returned worker_prompt. After the architect returns, call agent_loop_request_plan_approval.`,
+        args: {
+          plan_name: tool.schema
+            .string()
+            .describe("Slug for the plan file. Becomes .agent-loop/plans/{plan_name}.md"),
+          objective: tool.schema
+            .string()
+            .describe("High-level objective the plan must accomplish."),
+        },
+        async execute(args, context) {
+          if (!args.plan_name || !/^[a-zA-Z0-9_-]+$/.test(args.plan_name)) {
+            return JSON.stringify({
+              error:
+                "plan_name must be a slug (a-zA-Z0-9_-). Avoid spaces and slashes.",
+            });
+          }
+
+          orchestratorSessionId =
+            context.sessionID || orchestratorSessionId || null;
+
+          const planPath = join(plansDir(workdir), `${args.plan_name}.md`);
+          const fm = await readPlanFrontmatter(planPath);
+
+          if (fm.approved_at) {
+            return JSON.stringify({
+              error: "Plan already approved; cannot re-propose.",
+              plan_path: planPath,
+              approved_at: fm.approved_at,
+              next_action: `Call agent_loop_init with plan_path="${planPath}".`,
+            });
+          }
+
+          const priorPlanContent = await readPlanContent(planPath);
+          const accumulatedFeedback = await readPlanFeedback(planPath);
+          const accumulatedClarifications = await readPlanClarifications(planPath);
+          const nextRevision = (fm.revision ?? 0) + 1;
+
+          const workerPrompt = buildPlanArchitectPrompt({
+            plan_path: planPath,
+            plan_name: args.plan_name,
+            objective: args.objective,
+            revision: nextRevision,
+            prior_plan_content: priorPlanContent,
+            accumulated_feedback: accumulatedFeedback,
+            accumulated_clarifications: accumulatedClarifications,
+          });
+
+          return JSON.stringify({
+            action: "dispatch_plan_architect",
+            plan_path: planPath,
+            plan_name: args.plan_name,
+            revision: nextRevision,
+            worker_agent: "agent-loop-plan-architect",
+            worker_prompt: workerPrompt,
+            instructions:
+              "Dispatch `agent-loop-plan-architect` via the Task tool with worker_prompt as the task prompt. The architect's final response will be EITHER `PLAN_WRITTEN` (plan file is on disk → call agent_loop_request_plan_approval) OR `CLARIFY_REQUEST` (architect needs user input first → surface its Questions section to the user verbatim, collect answers, then call agent_loop_record_clarifications). Do NOT call agent_loop_init yet either way.",
+          });
+        },
+      }),
+
+      // -------------------------------------------------------------------
+      // agent_loop_request_plan_approval — HITL gate
+      // -------------------------------------------------------------------
+      agent_loop_request_plan_approval: tool({
+        description: `Surface the drafted plan to the user for approval. The orchestrator MUST present the returned plan content verbatim to the user and STOP — wait for the user to reply with their decision (approve / edit / regenerate). When the user replies, call agent_loop_record_plan_decision.`,
+        args: {
+          plan_path: tool.schema
+            .string()
+            .describe("Path to the plan file the architect just wrote."),
+        },
+        async execute(args) {
+          const planPath = args.plan_path.startsWith("/")
+            ? args.plan_path
+            : join(workdir, args.plan_path);
+
+          if (!existsSync(planPath)) {
+            return JSON.stringify({
+              error: `Plan file not found: ${planPath}`,
+            });
+          }
+
+          const fm = await readPlanFrontmatter(planPath);
+          if (fm.approved_at) {
+            return JSON.stringify({
+              status: "already_approved",
+              plan_path: planPath,
+              approved_at: fm.approved_at,
+              next_action: `Call agent_loop_init with plan_path="${planPath}".`,
+            });
+          }
+
+          const content = await readPlanContent(planPath);
+          const accumulatedFeedback = await readPlanFeedback(planPath);
+
+          return JSON.stringify({
+            action: "ask_user_for_plan_approval",
+            plan_path: planPath,
+            plan_name: fm.plan_name,
+            revision: fm.revision ?? 1,
+            plan_content: content,
+            prior_feedback_rounds: accumulatedFeedback || null,
+            user_question: [
+              "I drafted the plan above. Please reply with one of:",
+              "  - `approve` — accept as-is and start execution",
+              "  - `edit: <your feedback>` — keep the structure but make these changes",
+              "  - `regenerate: <your feedback>` — start over with a new approach",
+              "I will not proceed until you reply.",
+            ].join("\n"),
+            instructions:
+              "Present `plan_content` to the user verbatim, then ask the question above. STOP and wait. When the user replies, call agent_loop_record_plan_decision with their decision. Do not call any other agent_loop_* tool until the user responds.",
+          });
+        },
+      }),
+
+      // -------------------------------------------------------------------
+      // agent_loop_record_plan_decision — Apply user's verdict
+      // -------------------------------------------------------------------
+      agent_loop_record_plan_decision: tool({
+        description: `Record the user's decision on the proposed plan. If approve, the plan is stamped with approved_at and the orchestrator can call agent_loop_init. If edit/regenerate, the feedback is recorded and a fresh plan-architect dispatch prompt is returned for the orchestrator to send.`,
+        args: {
+          plan_path: tool.schema.string().describe("Path to the plan file."),
+          decision: tool.schema
+            .enum(["approve", "edit", "regenerate"])
+            .describe("User's verdict."),
+          feedback: tool.schema
+            .string()
+            .describe("User feedback (required for edit/regenerate; ignored for approve).")
+            .optional(),
+          objective: tool.schema
+            .string()
+            .describe("Original objective — pass through so the architect retains context on revision.")
+            .optional(),
+        },
+        async execute(args) {
+          const planPath = args.plan_path.startsWith("/")
+            ? args.plan_path
+            : join(workdir, args.plan_path);
+
+          if (!existsSync(planPath)) {
+            return JSON.stringify({ error: `Plan file not found: ${planPath}` });
+          }
+
+          if (args.decision === "approve") {
+            const stamped = await stampPlanApproved(planPath);
+            return JSON.stringify({
+              status: "approved",
+              plan_path: planPath,
+              approved_at: stamped.approved_at,
+              revision: stamped.revision,
+              next_action: `Call agent_loop_init with plan_path="${planPath}" to start execution.`,
+            });
+          }
+
+          // edit / regenerate
+          const feedback = (args.feedback || "").trim();
+          if (!feedback) {
+            return JSON.stringify({
+              error: `decision=${args.decision} requires non-empty feedback.`,
+            });
+          }
+
+          await appendPlanFeedback(planPath, feedback, args.decision);
+
+          const fm = await readPlanFrontmatter(planPath);
+          const nextRevision = (fm.revision ?? 1) + 1;
+          const priorPlanContent = await readPlanContent(planPath);
+          const accumulatedFeedback = await readPlanFeedback(planPath);
+          const accumulatedClarifications = await readPlanClarifications(planPath);
+          const planName = fm.plan_name || basename(planPath, ".md");
+
+          const workerPrompt = buildPlanArchitectPrompt({
+            plan_path: planPath,
+            plan_name: planName,
+            objective: args.objective || "(reuse the objective from the prior revision)",
+            revision: nextRevision,
+            prior_plan_content: priorPlanContent,
+            accumulated_feedback: accumulatedFeedback,
+            accumulated_clarifications: accumulatedClarifications,
+          });
+
+          return JSON.stringify({
+            status: "revision_requested",
+            decision: args.decision,
+            plan_path: planPath,
+            next_revision: nextRevision,
+            worker_agent: "agent-loop-plan-architect",
+            worker_prompt: workerPrompt,
+            instructions:
+              "Dispatch `agent-loop-plan-architect` again with worker_prompt. After it returns, call agent_loop_request_plan_approval again to re-enter the approval gate.",
+          });
+        },
+      }),
+
+      // -------------------------------------------------------------------
+      // agent_loop_record_clarifications — Persist user answers to the
+      //   architect's CLARIFY_REQUEST and re-dispatch the architect with
+      //   the answers attached. The plan-architect can keep cycling through
+      //   clarification rounds as long as it surfaces real unknowns.
+      // -------------------------------------------------------------------
+      agent_loop_record_clarifications: tool({
+        description: `When the plan-architect's last output was CLARIFY_REQUEST instead of PLAN_WRITTEN, surface the questions to the user, collect their answers, and call this tool with the (question, answer) pairs. The tool persists them to {plan_name}.clarifications.md and returns a fresh architect dispatch prompt that includes the accumulated clarifications. The revision number does NOT bump for clarification rounds — they are conversational, not authoring rounds.`,
+        args: {
+          plan_path: tool.schema.string().describe("Path to the plan file (same one used in propose_plan)."),
+          objective: tool.schema
+            .string()
+            .describe("Original objective — pass through so the architect retains context.")
+            .optional(),
+          qa_pairs: tool.schema
+            .array(
+              tool.schema.object({
+                question: tool.schema.string(),
+                answer: tool.schema.string(),
+              })
+            )
+            .describe(
+              "Array of {question, answer}. Question text should match what the architect asked (paraphrasing fine). Answer must come from the user — do not invent."
+            ),
+        },
+        async execute(args) {
+          const planPath = args.plan_path.startsWith("/")
+            ? args.plan_path
+            : join(workdir, args.plan_path);
+
+          const fm = await readPlanFrontmatter(planPath);
+          if (fm.approved_at) {
+            return JSON.stringify({
+              error: "Plan already approved; clarifications are no longer accepted.",
+              plan_path: planPath,
+            });
+          }
+
+          if (!Array.isArray(args.qa_pairs) || args.qa_pairs.length === 0) {
+            return JSON.stringify({
+              error: "qa_pairs must be a non-empty array.",
+            });
+          }
+          for (const pair of args.qa_pairs) {
+            if (!pair?.question?.trim() || !pair?.answer?.trim()) {
+              return JSON.stringify({
+                error: "Every qa_pair must have non-empty question and answer.",
+                offending: pair,
+              });
+            }
+          }
+
+          await appendPlanClarifications(planPath, args.qa_pairs);
+
+          const planName = fm.plan_name || basename(planPath, ".md");
+          // Clarifications do NOT bump revision; they only enrich the next
+          // dispatch's context. Revision = current revision (or 1 if no plan
+          // file yet exists on disk).
+          const revisionForNextDispatch = fm.revision ?? 1;
+
+          const priorPlanContent = await readPlanContent(planPath);
+          const accumulatedFeedback = await readPlanFeedback(planPath);
+          const accumulatedClarifications = await readPlanClarifications(planPath);
+
+          const workerPrompt = buildPlanArchitectPrompt({
+            plan_path: planPath,
+            plan_name: planName,
+            objective:
+              args.objective || "(reuse the objective from the prior dispatch)",
+            revision: revisionForNextDispatch,
+            prior_plan_content: priorPlanContent,
+            accumulated_feedback: accumulatedFeedback,
+            accumulated_clarifications: accumulatedClarifications,
+          });
+
+          return JSON.stringify({
+            status: "clarifications_recorded",
+            plan_path: planPath,
+            rounds_recorded: args.qa_pairs.length,
+            worker_agent: "agent-loop-plan-architect",
+            worker_prompt: workerPrompt,
+            instructions:
+              "Dispatch `agent-loop-plan-architect` again with worker_prompt. The architect's next output will EITHER be PLAN_WRITTEN (it had enough info this time) OR another CLARIFY_REQUEST (it still has unknowns — record those too and loop). Either way, do NOT call agent_loop_init until a plan is approved.",
+          });
+        },
+      }),
+
+      // -------------------------------------------------------------------
       // agent_loop_init — Initialize a new Agent Loop from a plan
       // -------------------------------------------------------------------
       agent_loop_init: tool({
-        description: `Initialize a new Agent Loop. Provide either:
-- An existing plan file path under .agent-loop/plans/
-- A plan name + task descriptions to create a new plan
-Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
+        description: `Initialize a new Agent Loop. Provide a plan_path. By default the runtime auto-stamps approved_at and starts immediately — the architect already extracted user intent via clarification rounds, so a separate approval click is just ceremony. To force the legacy "show plan, ask approve/edit/regenerate" gate (rare; only when user explicitly wants to review before any worker runs), pass auto_approve: false.`,
         args: {
           plan_path: tool.schema
             .string()
@@ -694,6 +1068,10 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           objective: tool.schema
             .string()
             .describe("High-level objective for generating a new plan (used with plan_name)")
+            .optional(),
+          auto_approve: tool.schema
+            .boolean()
+            .describe("Default true. If true, stamps approved_at automatically before starting. Set false ONLY when user explicitly requested a manual approval gate.")
             .optional(),
         },
         async execute(args, context) {
@@ -714,16 +1092,35 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             }
           } else if (args.plan_name && args.objective) {
             return JSON.stringify({
-              action: "create_plan",
-              plan_name: args.plan_name,
-              plan_dir: plansDir(workdir),
-              instructions: `Create a plan file at .agent-loop/plans/${args.plan_name}.md with the standard format (TL;DR, Context, Work Objectives, TODOs). The objective is: ${args.objective}. After creating the plan, call agent_loop_init again with the plan_path.`,
+              error: "Plan creation goes through agent_loop_propose_plan first.",
+              next_action: `Call agent_loop_propose_plan with plan_name="${args.plan_name}" and objective="${args.objective}". The plan-architect will draft the plan (asking clarifying questions if needed). When it returns PLAN_WRITTEN, call agent_loop_init with the plan_path.`,
             });
           } else {
             return JSON.stringify({
               error:
-                "Provide either plan_path (existing plan) or plan_name + objective (new plan)",
+                "Provide plan_path (or call agent_loop_propose_plan first to create a plan).",
             });
+          }
+
+          // Approval gate: by default auto-approve so we don't ask the user
+          // for ceremonial confirmation. Clarifying questions during the
+          // architect phase already extracted user intent; a second
+          // approve/edit/regenerate prompt is friction. The legacy manual
+          // gate stays available via auto_approve: false.
+          const autoApprove = args.auto_approve !== false;
+          let fm = await readPlanFrontmatter(planPath);
+          if (!fm.approved_at) {
+            if (autoApprove) {
+              await stampPlanApproved(planPath);
+              fm = await readPlanFrontmatter(planPath);
+            } else {
+              return JSON.stringify({
+                error: "Plan not approved and auto_approve was disabled.",
+                plan_path: planPath,
+                next_action:
+                  "Call agent_loop_request_plan_approval, then agent_loop_record_plan_decision. Or call agent_loop_init again without auto_approve=false.",
+              });
+            }
           }
 
           // Parse the plan
@@ -921,14 +1318,141 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       }),
 
       // -------------------------------------------------------------------
+      // agent_loop_pick_batch — Return all task_keys ready to dispatch
+      //                          in parallel right now, with the metadata
+      //                          the orchestrator needs to judge coupling
+      // -------------------------------------------------------------------
+      agent_loop_pick_batch: tool({
+        description: `Return ALL task_keys whose dependencies are satisfied. Each entry includes the metadata (file paths, acceptance criteria, must-not-do, parallel-group hint) the orchestrator needs to JUDGE COUPLING and decide which subset to actually run in parallel. Dependency-graph independence is necessary but not sufficient: two tasks may depend only on a common ancestor yet still mutate the same file. The orchestrator must reason over file overlap, shared resources, and task-type risk before issuing concurrent dispatches.`,
+        args: {
+          max: tool.schema
+            .number()
+            .describe("Soft cap on how many ready tasks to return. Default 8.")
+            .optional(),
+        },
+        async execute(args) {
+          if (!activeLoopId) {
+            return JSON.stringify({ error: "No active loop." });
+          }
+          const state = await readBoulder(workdir, activeLoopId);
+          if (!state) {
+            return JSON.stringify({ error: "No active loop state." });
+          }
+          const cap = typeof args.max === "number" && args.max > 0 ? args.max : 8;
+          const readyKeys = pickReadyTasks(state, cap);
+          const inFlight = inProgressTaskKeys(state);
+
+          // Resolve full task records from the plan so we can return enough
+          // metadata for coupling judgment.
+          let plan: Awaited<ReturnType<typeof parsePlan>> | null = null;
+          try {
+            plan = await parsePlan(state.active_plan);
+          } catch {
+            plan = null;
+          }
+
+          const truncate = (s: string, n: number) =>
+            s.length > n ? s.slice(0, n).trim() + "…" : s.trim();
+
+          const readyWithMeta = readyKeys.map((k) => {
+            const t = plan?.tasks.find((x) => x.key === k);
+            const desc = t?.description ?? "";
+            const acc = t?.acceptance_criteria ?? "";
+            const refs = t?.references ?? "";
+            // Extract paths from every segment that mentions concrete files.
+            const file_paths =
+              t?.file_paths && t.file_paths.length > 0
+                ? t.file_paths
+                : extractFilePaths(`${desc}\n${acc}\n${refs}`);
+            return {
+              task_key: k,
+              task_title: state.task_sessions[k]?.task_title,
+              attempts: state.task_sessions[k]?.attempts ?? 0,
+              dependencies: state.task_sessions[k]?.dependencies ?? [],
+              acceptance_criteria: truncate(acc, 400),
+              must_not_do: truncate(t?.must_not_do ?? "", 200),
+              references: truncate(refs, 200),
+              file_paths,
+              task_type: t?.task_type ?? inferTaskType(desc),
+              parallel_group: t?.parallel_group ?? null,
+            };
+          });
+
+          // Heuristic file-overlap pre-check (advisory only).
+          const overlapPairs: { a: string; b: string; shared: string[] }[] = [];
+          for (let i = 0; i < readyWithMeta.length; i++) {
+            for (let j = i + 1; j < readyWithMeta.length; j++) {
+              const a = readyWithMeta[i];
+              const b = readyWithMeta[j];
+              const shared = a.file_paths.filter((p) => b.file_paths.includes(p));
+              if (shared.length > 0) {
+                overlapPairs.push({ a: a.task_key, b: b.task_key, shared });
+              }
+            }
+          }
+
+          let instructions: string;
+          if (readyWithMeta.length === 0) {
+            instructions =
+              inFlight.length > 0
+                ? "Nothing new is ready; the existing batch is still running. Wait for in-progress workers to return."
+                : "No ready or in-flight tasks. Either all done, all blocked, or dependencies elsewhere. Check agent_loop_status.";
+          } else if (readyWithMeta.length === 1) {
+            instructions = "Only one task is ready right now. Dispatch it normally.";
+          } else {
+            instructions = [
+              `${readyWithMeta.length} tasks have their dependencies satisfied. Decide WHICH SUBSET to run in parallel.`,
+              "",
+              "Heuristics for parallel-safe:",
+              "  • Same `parallel_group` tag → safe to run together (architect-blessed).",
+              "  • `file_paths` and `references` do NOT overlap → likely safe.",
+              "  • All `task_type: impl` AND modify disjoint directories → likely safe.",
+              "",
+              "Heuristics for must-serialize:",
+              "  • Any pair listed in `coupling_warnings.file_overlap` below.",
+              "  • Tasks that touch shared schema (DB migration, generated client, lockfile, tsconfig, CI config).",
+              "  • Tasks whose `must_not_do` mentions concurrent edits.",
+              "  • `task_type: verify` — should run alone after its inputs settle.",
+              "",
+              "Recipe: choose your parallel subset, call `agent_loop_dispatch` for each in that subset, then issue ALL their `task_prompt`s to the Task tool IN THE SAME RESPONSE (one tool_use block per task) so OpenCode runs them concurrently. Run any serialized leftovers in a follow-up turn.",
+            ].join("\n");
+          }
+
+          return JSON.stringify({
+            ready_tasks: readyWithMeta,
+            in_progress: inFlight,
+            cap,
+            coupling_warnings: {
+              file_overlap: overlapPairs,
+              note:
+                overlapPairs.length > 0
+                  ? "These pairs reference at least one common file path. Consider serializing them or splitting the batch."
+                  : "No automatic file-overlap detected — but extract_file_paths is heuristic; verify by reading task descriptions.",
+            },
+            instructions,
+          });
+        },
+      }),
+
+      // -------------------------------------------------------------------
       // agent_loop_dispatch — Build the worker prompt and dispatch
       // -------------------------------------------------------------------
       agent_loop_dispatch: tool({
-        description: `Prepare the worker prompt for a specific task. Returns the constructed prompt that should be passed to the worker subagent chosen by the orchestrator. The prompt contains ONLY what the worker needs: task description, notepad learnings, previous handoff context, and relevant file paths. This ensures true context isolation.`,
+        description: `Prepare a specific task for worker dispatch. Writes the full worker prompt to a per-loop prompt file and returns a short task_prompt + the subagent to dispatch to. The orchestrator must pass the returned worker_agent and task_prompt to the Task tool verbatim — the only valid subagents are agent-loop-worker (default) and agent-test-worker (auto-selected for MonkeyTest tasks). Specialist personas are injected into the prompt file via persona_id; they are NOT separate subagents.`,
         args: {
           task_key: tool.schema
             .string()
             .describe('The task key to dispatch (e.g. "todo:1")'),
+          persona_id: tool.schema
+            .string()
+            .describe(
+              "Optional persona_id from agent_loop_suggest_workers or agent_loop_list_workers. Injects that persona's expertise into the worker prompt file. Always dispatched to agent-loop-worker — do NOT use the persona name as subagent_type."
+            )
+            .optional(),
+          inline_prompt: tool.schema
+            .boolean()
+            .describe("Debug/compatibility escape hatch. If true, also returns the full worker_prompt inline. Default false.")
+            .optional(),
         },
         async execute(args, context) {
           if (!activeLoopId) {
@@ -1007,11 +1531,55 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
 
           // Build the worker payload
           const payload = await buildPayloadForTask(activeLoopId, state, task);
-          const workerPrompt = buildWorkerPrompt(payload);
+
+          // Resolve optional persona injection. If the orchestrator passes a
+          // persona_id, look up the body and inject as a prompt prefix.
+          let persona = null as
+            | { persona_id: string; persona_name: string; persona_body: string }
+            | null;
+          if (args.persona_id) {
+            const found = await getPersonaBody(args.persona_id);
+            if (!found) {
+              return JSON.stringify({
+                error: `Unknown persona_id: ${args.persona_id}`,
+                next_action:
+                  "Call agent_loop_suggest_workers to find valid persona_id values, then retry agent_loop_dispatch with one of them (or omit persona_id to use a generic worker).",
+              });
+            }
+            persona = {
+              persona_id: found.persona_id,
+              persona_name: found.name,
+              persona_body: found.body,
+            };
+          }
+
+          const workerPrompt = buildWorkerPrompt(payload, persona);
+
           const isAgentTestTask =
             task.title.startsWith("Test Route:") ||
             task.title.startsWith("Review Route:") ||
             task.title === "Generate MonkeyTest Final Report";
+
+          // The OpenCode subagent ID is fixed. Personas are prompt prefixes,
+          // never subagent IDs.
+          const workerAgent = isAgentTestTask
+            ? "agent-test-worker"
+            : "agent-loop-worker";
+
+          const promptFile = await writeWorkerPrompt(
+            workdir,
+            activeLoopId,
+            args.task_key,
+            workerPrompt
+          );
+          const taskPrompt = buildTaskPromptFromPromptFile(
+            promptFile.relative_path,
+            args.task_key,
+            taskSession.task_title
+          );
+          const inlinePrompt =
+            args.inline_prompt === true ||
+            process.env.AGENT_LOOP_INLINE_WORKER_PROMPTS === "1";
 
           // Mark task as started
           markTaskStarted(state, args.task_key);
@@ -1021,12 +1589,19 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             action: "dispatch",
             task_key: args.task_key,
             task_title: taskSession.task_title,
-            worker_agent: isAgentTestTask ? "agent-test-worker" : undefined,
-            worker_prompt: workerPrompt,
-            instructions:
-              isAgentTestTask
-                ? `Dispatch this task to \`agent-test-worker\` using the Task tool. Pass worker_prompt exactly as the task prompt. Do NOT add any additional context. After the worker returns, call agent_loop_process_handoff with the worker's output.`
-                : `Choose the most appropriate available worker subagent for this task, then dispatch it using the Task tool with worker_prompt as the task prompt. Do NOT add any additional context — the prompt is self-contained. After the worker returns, call agent_loop_process_handoff with the worker's output.`,
+            worker_agent: workerAgent,
+            persona_id: persona?.persona_id ?? null,
+            persona_name: persona?.persona_name ?? null,
+            prompt_mode: inlinePrompt ? "inline_and_file" : "file",
+            prompt_path: promptFile.relative_path,
+            prompt_bytes: workerPrompt.length,
+            task_prompt: taskPrompt,
+            ...(inlinePrompt ? { worker_prompt: workerPrompt } : {}),
+            instructions: isAgentTestTask
+              ? `Dispatch via the Task tool with subagent_type="agent-test-worker". Pass task_prompt verbatim as the task prompt. The worker will read prompt_path for the full assignment. After the worker returns, call agent_loop_process_handoff with the worker's full output.`
+              : persona
+                ? `Dispatch via the Task tool with subagent_type="agent-loop-worker" (NOT the persona name). The persona "${persona.persona_name}" is already written into prompt_path. Pass task_prompt verbatim. After the worker returns, call agent_loop_process_handoff with the worker's full output.`
+                : `Dispatch via the Task tool with subagent_type="agent-loop-worker". To inject a specialist persona, call agent_loop_suggest_workers, pick a persona_id, and re-call agent_loop_dispatch with persona_id set. Pass task_prompt verbatim. After the worker returns, call agent_loop_process_handoff with the worker's full output.`,
           });
         },
       }),
@@ -1036,14 +1611,181 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       // -------------------------------------------------------------------
       agent_loop_list_workers: tool({
         description:
-          "List hidden worker personas discovered from the vendored worker catalog. Use this to choose the most appropriate subagent for a task.",
-        args: {},
-        async execute() {
+          "List specialist personas from the vendored catalog. Default output is a lightweight category summary; pass category/search to return a bounded list. To pick a persona for a task, prefer agent_loop_suggest_workers.",
+        args: {
+          category: tool.schema
+            .string()
+            .describe("Optional filter (e.g. 'engineering', 'design', 'marketing').")
+            .optional(),
+          search: tool.schema
+            .string()
+            .describe("Optional substring matched against persona_id, name, or description (case-insensitive).")
+            .optional(),
+          limit: tool.schema
+            .number()
+            .describe("Maximum workers to return. Default 8, max 20 unless include_all=true.")
+            .optional(),
+          include_all: tool.schema
+            .boolean()
+            .describe("Expensive escape hatch. If true, returns all matching workers instead of the bounded list.")
+            .optional(),
+        },
+        async execute(args) {
           const catalog = await loadWorkerCatalog(workdir);
+          const categories = summarizeWorkerCategories(catalog.workers);
+
+          if (!args.category && !args.search && args.include_all !== true) {
+            return JSON.stringify({
+              catalog_roots: catalog.roots,
+              total: catalog.workers.length,
+              returned: 0,
+              categories,
+              workers: [],
+              usage:
+                "This default response is intentionally small. Call agent_loop_suggest_workers(task_key) for a task-specific recommendation, or call agent_loop_list_workers with category/search and an optional limit.",
+              examples: [
+                'agent_loop_suggest_workers({"task_key":"todo:3","top_k":3})',
+                'agent_loop_list_workers({"category":"engineering","search":"frontend","limit":5})',
+              ],
+            });
+          }
+
+          let workers = catalog.workers;
+          if (args.category) {
+            const c = args.category.toLowerCase();
+            workers = workers.filter((w) => w.category.toLowerCase() === c);
+          }
+          if (args.search) {
+            workers = rankWorkerCatalog(workers, args.search)
+              .filter((w) => w.score > 0)
+              .map((w) => w.worker);
+          }
+
+          const includeAll = args.include_all === true;
+          const limit = includeAll
+            ? workers.length
+            : normalizeLimit(args.limit, 8, 20);
+          const returnedWorkers = workers.slice(0, limit);
+
           return JSON.stringify({
             catalog_roots: catalog.roots,
-            count: catalog.workers.length,
-            workers: catalog.workers,
+            total: catalog.workers.length,
+            matched: workers.length,
+            returned: returnedWorkers.length,
+            limit: includeAll ? null : limit,
+            truncated: returnedWorkers.length < workers.length,
+            categories,
+            usage:
+              "Pick a persona_id, then call agent_loop_dispatch(task_key, persona_id). Prefer agent_loop_suggest_workers(task_key) when choosing for a specific task.",
+            workers: returnedWorkers.map((w) => ({
+              persona_id: w.persona_id,
+              name: w.name,
+              category: w.category,
+              description: w.description,
+            })),
+          });
+        },
+      }),
+
+      // -------------------------------------------------------------------
+      // agent_loop_suggest_workers — Task-aware bounded persona search
+      // -------------------------------------------------------------------
+      agent_loop_suggest_workers: tool({
+        description:
+          "Return a small ranked set of persona candidates for a specific task or intent. This avoids dumping the full persona catalog into the orchestrator context.",
+        args: {
+          task_key: tool.schema
+            .string()
+            .describe('Optional active-plan task key (e.g. "todo:3"). If provided, the tool reads task metadata from the active plan.')
+            .optional(),
+          intent: tool.schema
+            .string()
+            .describe("Optional free-text intent when no task_key is available.")
+            .optional(),
+          category: tool.schema
+            .string()
+            .describe("Optional category filter (e.g. engineering, design, testing).")
+            .optional(),
+          file_paths: tool.schema
+            .array(tool.schema.string())
+            .describe("Optional relevant file paths used as routing hints.")
+            .optional(),
+          top_k: tool.schema
+            .number()
+            .describe("Number of candidates to return. Default 5, max 10.")
+            .optional(),
+        },
+        async execute(args) {
+          const catalog = await loadWorkerCatalog(workdir);
+          let task: PlanTask | null = null;
+          let taskSource: string | null = null;
+
+          if (args.task_key) {
+            if (!activeLoopId) {
+              return JSON.stringify({
+                error: "task_key was provided but there is no active loop.",
+                next_action:
+                  "Pass intent/file_paths instead, or call agent_loop_resume first.",
+              });
+            }
+            const state = await readBoulder(workdir, activeLoopId);
+            if (!state) {
+              return JSON.stringify({ error: "No active loop state." });
+            }
+            const plan = await parsePlan(state.active_plan);
+            task = plan.tasks.find((t) => t.key === args.task_key) ?? null;
+            if (!task) {
+              return JSON.stringify({
+                error: `Task ${args.task_key} not found in active plan.`,
+                available: plan.tasks.map((t) => t.key),
+              });
+            }
+            taskSource = `${task.key}: ${task.title}`;
+          }
+
+          const filePaths = [
+            ...(task?.file_paths ?? []),
+            ...((args.file_paths as string[] | undefined) ?? []),
+          ];
+          const query = [
+            args.intent || "",
+            task?.title || "",
+            task?.description || "",
+            task?.acceptance_criteria || "",
+            task?.references || "",
+            task?.must_not_do || "",
+            task?.task_type || "",
+            filePaths.join(" "),
+          ]
+            .filter(Boolean)
+            .join("\n");
+
+          if (!query.trim() && !args.category) {
+            return JSON.stringify({
+              error: "Provide task_key, intent, category, or file_paths.",
+            });
+          }
+
+          const category = args.category?.trim() || undefined;
+          const topK = normalizeLimit(args.top_k, 5, 10);
+          const candidates = suggestWorkerCandidates(
+            catalog.workers,
+            query,
+            filePaths,
+            category,
+            topK
+          );
+
+          return JSON.stringify({
+            task_key: task?.key ?? null,
+            task_title: task?.title ?? null,
+            query_source: taskSource || (args.intent ? "intent" : "filters"),
+            category: category ?? null,
+            total_workers: catalog.workers.length,
+            returned: candidates.length,
+            usage:
+              "Choose one persona_id if it materially improves the task, then call agent_loop_dispatch(task_key, persona_id). If none fit, omit persona_id and use the generic agent-loop-worker.",
+            candidates,
           });
         },
       }),
@@ -1085,17 +1827,11 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
               error: `Cannot process handoff for ${args.task_key} because task is ${taskSession.status}. Dispatch it first.`,
               task_key: args.task_key,
               task_status: taskSession.status,
-              current_task: state.current_task,
+              in_progress: inProgressTaskKeys(state),
             });
           }
-
-          if (state.current_task && state.current_task !== args.task_key) {
-            return JSON.stringify({
-              error: `Cannot process handoff for ${args.task_key} while ${state.current_task} is current in-progress task.`,
-              task_key: args.task_key,
-              current_task: state.current_task,
-            });
-          }
+          // Multi-task: any in-progress task can post a handoff regardless of
+          // which one is the "primary" current_task pointer.
 
           // Parse the handoff from worker output
           const parsed = parseHandoffFromWorkerOutput(args.worker_output);
@@ -1217,7 +1953,18 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             timestamp: new Date().toISOString(),
           } as ReturnType<typeof import("./gate").runBackpressureGate> extends Promise<infer T> ? T : never;
 
-          if (!args.skip_gate) {
+          // Optimistically mark this task done so the in-progress check below
+          // sees the correct count for the rest of the batch.
+          markTaskDone(state, args.task_key);
+
+          // Defer the gate while there are siblings still in-flight. Running
+          // `pnpm build`/equivalents 6 times concurrently would thrash and
+          // produce noisy failures. The last handoff in a batch runs the gate
+          // once, gating the whole batch.
+          const stillRunning = inProgressTaskKeys(state);
+          const deferGate = stillRunning.length > 0;
+
+          if (!args.skip_gate && !deferGate) {
             try {
               gateResult = await runBackpressureGate(runShell, workdir);
             } catch (e: any) {
@@ -1232,7 +1979,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           }
 
           if (gateResult.passed) {
-            markTaskDone(state, args.task_key);
+            // already marked done above
             state.stats.backpressure_failures = Math.max(
               0,
               (state.stats.backpressure_failures || 0)
@@ -1240,6 +1987,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           } else {
             state.stats.backpressure_failures =
               (state.stats.backpressure_failures || 0) + 1;
+            // Roll back the optimistic done and record the failure.
             markTaskFailed(
               state,
               args.task_key,
@@ -1247,7 +1995,8 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             );
           }
 
-          const nextKey = pickNextTask(state);
+          const readyKeys = pickReadyTasks(state);
+          const nextKey = readyKeys[0] ?? null;
           const allDone = isLoopComplete(state);
           const halted = shouldHalt(state);
 
@@ -1273,47 +2022,75 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           const doneTasks = Object.values(state.task_sessions).filter(
             (t) => t.status === "done"
           );
+          const stillRunningAfter = inProgressTaskKeys(state);
+
+          const gateState: "passed" | "failed" | "deferred" = deferGate
+            ? "deferred"
+            : gateResult.passed
+              ? "passed"
+              : "failed";
+
+          let nextAction: string;
+          if (allDone) {
+            nextAction = "All tasks complete! Generate a completion report.";
+          } else if (halted) {
+            nextAction =
+              "Loop halted. Review blocked tasks and decide how to proceed.";
+          } else if (deferGate) {
+            nextAction = `Batch in flight: ${stillRunningAfter.length} sibling task(s) still running (${stillRunningAfter.join(", ")}). Wait for their handoffs; the gate runs once when the last one returns. Do not dispatch new tasks until then unless they are independent of the running batch.`;
+          } else if (gateResult.passed) {
+            nextAction = readyKeys.length > 1
+              ? `${readyKeys.length} tasks are ready in parallel. Call agent_loop_pick_batch then dispatch them concurrently in this turn.`
+              : nextKey
+                ? `Dispatch next: agent_loop_dispatch("${nextKey}")`
+                : "No more tasks.";
+          } else {
+            const ts = state.task_sessions[args.task_key];
+            nextAction = `Gate failed for ${args.task_key}. ${
+              ts && ts.attempts < ts.max_attempts
+                ? `Retry: agent_loop_dispatch("${args.task_key}")`
+                : `Task blocked. Move to next: agent_loop_dispatch("${nextKey || "none"}")`
+            }`;
+          }
 
           return JSON.stringify({
-            status: gateResult.passed ? "done" : "gate_failed",
+            status:
+              gateState === "passed"
+                ? "done"
+                : gateState === "deferred"
+                  ? "done_pending_gate"
+                  : "gate_failed",
+            gate_state: gateState,
             task_key: args.task_key,
             summary: compressedSummary,
-            gate: {
-              passed: gateResult.passed,
-              build: gateResult.build
-                ? { passed: gateResult.build.passed }
-                : null,
-              test: gateResult.test
-                ? { passed: gateResult.test.passed }
-                : null,
-              lint: gateResult.lint
-                ? { passed: gateResult.lint.passed }
-                : null,
-            },
-            gate_details: !gateResult.passed
-              ? formatGateResult(gateResult)
-              : undefined,
+            gate: deferGate
+              ? null
+              : {
+                  passed: gateResult.passed,
+                  build: gateResult.build
+                    ? { passed: gateResult.build.passed }
+                    : null,
+                  test: gateResult.test
+                    ? { passed: gateResult.test.passed }
+                    : null,
+                  lint: gateResult.lint
+                    ? { passed: gateResult.lint.passed }
+                    : null,
+                },
+            gate_details:
+              !deferGate && !gateResult.passed
+                ? formatGateResult(gateResult)
+                : undefined,
             progress: `${doneTasks.length}/${state.stats.total_tasks}`,
+            in_progress: stillRunningAfter,
+            ready_tasks: readyKeys,
             all_done: allDone,
             halted,
             next_task: nextKey,
             next_task_title: nextKey
               ? state.task_sessions[nextKey]?.task_title
               : null,
-            next_action: allDone
-              ? "All tasks complete! Generate a completion report."
-              : halted
-              ? "Loop halted. Review blocked tasks and decide how to proceed."
-              : gateResult.passed && nextKey
-              ? `Dispatch next: agent_loop_dispatch("${nextKey}")`
-              : !gateResult.passed
-              ? `Gate failed for ${args.task_key}. ${
-                  state.task_sessions[args.task_key].attempts <
-                  state.task_sessions[args.task_key].max_attempts
-                    ? `Retry: agent_loop_dispatch("${args.task_key}")`
-                    : `Task blocked. Move to next: agent_loop_dispatch("${nextKey || "none"}")`
-                }`
-              : "No more tasks.",
+            next_action: nextAction,
           });
         },
       }),
@@ -1429,7 +2206,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       // -------------------------------------------------------------------
       agent_loop_halt: tool({
         description:
-          "Manually halt the Agent Loop. Tasks in progress will be marked as paused.",
+          "Manually pause the Agent Loop. All tasks currently in progress will be reset to pending so resume cannot strand a parallel batch.",
         args: {
           reason: tool.schema
             .string()
@@ -1441,36 +2218,42 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
             return JSON.stringify({ error: "No active loop." });
           }
 
-          const state = await readBoulder(workdir, activeLoopId);
+          const haltedLoopId = activeLoopId;
+          const state = await readBoulder(workdir, haltedLoopId);
           if (!state) {
             return JSON.stringify({ error: "No active loop." });
           }
 
-          const runtime = await readRuntimeState(workdir, activeLoopId);
+          const runtime = await readRuntimeState(workdir, haltedLoopId);
 
           state.status = "paused";
-          if (state.current_task) {
-            const t = state.task_sessions[state.current_task];
-            if (t && t.status === "in-progress") {
+          const resetTasks = inProgressTaskKeys(state);
+          for (const taskKey of resetTasks) {
+            const t = state.task_sessions[taskKey];
+            if (t?.status === "in-progress") {
               t.status = "pending";
             }
-            state.current_task = null;
           }
-          await writeBoulder(workdir, activeLoopId, state);
+          state.current_task = null;
+          await writeBoulder(workdir, haltedLoopId, state);
           loopActive = false;
           if (runtime) {
             runtime.active = false;
             runtime.pending_save_progress = false;
-            await writeRuntimeState(workdir, activeLoopId, runtime);
+            await writeRuntimeState(workdir, haltedLoopId, runtime);
           }
 
           // Clear active loop pointer
           await clearActiveLoopPointer(workdir);
+          if (activeLoopId === haltedLoopId) {
+            activeLoopId = null;
+          }
 
           return JSON.stringify({
             status: "paused",
-            loop_id: activeLoopId,
+            loop_id: haltedLoopId,
             reason: args.reason || "Manual halt",
+            reset_tasks: resetTasks,
             progress: `${state.stats.done}/${state.stats.total_tasks}`,
             message:
               "Loop paused. Use agent_loop_resume to continue later.",
@@ -1532,20 +2315,45 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
       agent_loop_completion_report: tool({
         description:
           "Generate a completion report for the finished Agent Loop. Summarizes all tasks, decisions, and learnings.",
-        args: {},
+        args: {
+          loop_id: tool.schema
+            .string()
+            .describe("Specific loop ID to report. Optional; defaults to the active loop, then the most recently completed/halted/failed loop.")
+            .optional(),
+        },
         async execute(args, context) {
-          if (!activeLoopId) {
-            return JSON.stringify({ error: "No active loop." });
+          const loops = await listLoops(workdir);
+          const targetLoopId =
+            args.loop_id ||
+            activeLoopId ||
+            lastTerminalLoopId ||
+            loops.find((l) => isTerminalLoopStatus(l.status))?.loop_id ||
+            null;
+
+          if (!targetLoopId) {
+            return JSON.stringify({
+              error: "No loop available for completion report.",
+              available_loops: loops.map((l) => ({
+                loop_id: l.loop_id,
+                status: l.status,
+                progress: l.progress,
+                updated_at: l.updated_at,
+              })),
+            });
           }
 
-          const state = await readBoulder(workdir, activeLoopId);
+          const state = await readBoulder(workdir, targetLoopId);
           if (!state) {
-            return JSON.stringify({ error: "No loop state found." });
+            return JSON.stringify({
+              error: "No loop state found.",
+              loop_id: targetLoopId,
+              available_loops: loops.map((l) => l.loop_id),
+            });
           }
 
-          const learnings = await readNotepad(workdir, activeLoopId, "learnings");
-          const decisions = await readNotepad(workdir, activeLoopId, "decisions");
-          const issues = await readNotepad(workdir, activeLoopId, "issues");
+          const learnings = await readNotepad(workdir, targetLoopId, "learnings");
+          const decisions = await readNotepad(workdir, targetLoopId, "decisions");
+          const issues = await readNotepad(workdir, targetLoopId, "issues");
 
           const tasks = Object.values(state.task_sessions);
           const done = tasks.filter((t) => t.status === "done");
@@ -1555,7 +2363,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
           const report = [
             `# Agent Loop Completion Report`,
             ``,
-            `**Loop ID**: ${activeLoopId}`,
+            `**Loop ID**: ${targetLoopId}`,
             `**Plan**: ${state.plan_name}`,
             `**Started**: ${state.started_at}`,
             `**Completed**: ${state.updated_at}`,
@@ -1586,7 +2394,7 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
 
           // Write report to loop-specific directory
           const reportPath = join(
-            loopInstanceDir(workdir, activeLoopId),
+            loopInstanceDir(workdir, targetLoopId),
             `report-${state.plan_name}.md`
           );
           await writeFile(reportPath, report, "utf-8");
@@ -1604,24 +2412,225 @@ Reads the plan, parses TODOs, creates boulder.json, and activates the loop.`,
 
 function extractFilePaths(text: string): string[] {
   const patterns = [
-    // Backtick-wrapped paths
+    // Backtick-wrapped concrete files (with extension)
     /`([a-zA-Z0-9_\-./]+\.[a-zA-Z]+)`/g,
-    // Common source file patterns
-    /(?:src|lib|app|test|tests|pkg)\/[a-zA-Z0-9_\-./]+\.[a-zA-Z]+/g,
+    // Backtick-wrapped directory paths (multi-segment, no extension required)
+    /`([a-zA-Z0-9_\-./]+\/[a-zA-Z0-9_\-./]*)`/g,
+    // Bare source file patterns (no backticks)
+    /(?:src|lib|app|test|tests|pkg|web|server|client|api|components)\/[a-zA-Z0-9_\-./]+(?:\.[a-zA-Z]+)?/g,
   ];
 
   const paths = new Set<string>();
   for (const pattern of patterns) {
     let m: RegExpExecArray | null;
     while ((m = pattern.exec(text)) !== null) {
-      const p = m[1] || m[0];
-      // Filter out things that aren't likely file paths
-      if (p.includes("/") && !p.startsWith("http")) {
-        paths.add(p);
-      }
+      let p = m[1] || m[0];
+      if (!p.includes("/") || p.startsWith("http") || p.startsWith("//")) continue;
+      // Normalize trailing slashes so `foo/bar/` and `foo/bar` collide.
+      p = p.replace(/\/+$/, "");
+      paths.add(p);
     }
   }
   return [...paths];
+}
+
+function inferTaskType(text: string): NonNullable<PlanTask["task_type"]> {
+  if (/\bspike\b/i.test(text)) return "spike";
+  if (/\bverify\b/i.test(text)) return "verify";
+  return "impl";
+}
+
+function buildTaskPromptFromPromptFile(
+  promptPath: string,
+  taskKey: string,
+  taskTitle: string
+): string {
+  return [
+    `Read \`${promptPath}\` first. It is your full assignment for ${taskKey}: ${taskTitle}.`,
+    "Follow that assignment exactly, including its constraints and verification instructions.",
+    "Do not ask the orchestrator to paste the prompt body. Use the Read tool on the prompt file.",
+    "When finished or blocked, return the required HANDOFF_START ... HANDOFF_END block as your final response.",
+  ].join("\n");
+}
+
+function normalizeLimit(
+  value: unknown,
+  fallback: number,
+  max: number
+): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(Math.floor(value), max));
+}
+
+function summarizeWorkerCategories(workers: WorkerCatalogEntry[]): {
+  category: string;
+  count: number;
+}[] {
+  const counts = new Map<string, number>();
+  for (const w of workers) {
+    counts.set(w.category, (counts.get(w.category) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([category, count]) => ({ category, count }))
+    .sort((a, b) => a.category.localeCompare(b.category));
+}
+
+function tokenizeForWorkerSearch(text: string): string[] {
+  const tokens =
+    text
+      .toLowerCase()
+      .match(/[a-z0-9][a-z0-9_-]{1,}|[\u4e00-\u9fff]{2,}/g) || [];
+  return [...new Set(tokens.map((t) => t.replace(/_/g, "-")))];
+}
+
+function inferWorkerRoutingTerms(
+  query: string,
+  filePaths: string[]
+): { terms: string[]; reasons: string[] } {
+  const haystack = `${query}\n${filePaths.join("\n")}`.toLowerCase();
+  const terms = new Set<string>();
+  const reasons: string[] = [];
+
+  const add = (condition: boolean, newTerms: string[], reason: string) => {
+    if (!condition) return;
+    for (const term of newTerms) terms.add(term);
+    reasons.push(reason);
+  };
+
+  add(
+    /(component|frontend|react|vue|svelte|css|tailwind|ui|ux|page|app\/|web\/|client\/|components\/)/.test(haystack),
+    ["frontend", "ui", "design", "react", "component"],
+    "UI/frontend file or keyword match"
+  );
+  add(
+    /(api|route|controller|server|backend|service|auth|jwt|oauth|session|middleware)/.test(haystack),
+    ["backend", "api", "server", "auth", "security"],
+    "API/backend/auth keyword match"
+  );
+  add(
+    /(database|schema|migration|sql|postgres|mysql|sqlite|prisma|drizzle|orm)/.test(haystack),
+    ["database", "backend", "data", "schema"],
+    "database/schema keyword match"
+  );
+  add(
+    /(test|spec|playwright|cypress|vitest|jest|qa|verify|accessibility|a11y)/.test(haystack),
+    ["testing", "qa", "accessibility", "verify"],
+    "testing/verification keyword match"
+  );
+  add(
+    /(docker|kubernetes|k8s|deploy|deployment|ci|workflow|github\/workflows|infra|sre|devops)/.test(haystack),
+    ["devops", "sre", "infrastructure", "ci"],
+    "deployment/CI/infrastructure keyword match"
+  );
+  add(
+    /(readme|docs|documentation|technical writer|markdown|guide)/.test(haystack),
+    ["technical", "writer", "documentation", "docs"],
+    "documentation keyword match"
+  );
+
+  return { terms: [...terms], reasons };
+}
+
+function scoreWorker(
+  worker: WorkerCatalogEntry,
+  terms: string[],
+  routingReasons: string[],
+  category?: string
+): { score: number; why: string[] } {
+  const name = worker.name.toLowerCase();
+  const description = worker.description.toLowerCase();
+  const id = worker.persona_id.toLowerCase();
+  const workerCategory = worker.category.toLowerCase();
+  const why = new Set<string>();
+  let score = 0;
+
+  if (category && workerCategory === category.toLowerCase()) {
+    score += 6;
+    why.add(`category=${worker.category}`);
+  }
+
+  for (const term of terms) {
+    if (term.length < 2) continue;
+    if (name.includes(term)) {
+      score += 5;
+      why.add(`name matches "${term}"`);
+    } else if (id.includes(term)) {
+      score += 4;
+      why.add(`persona_id matches "${term}"`);
+    } else if (description.includes(term)) {
+      score += 3;
+      why.add(`description matches "${term}"`);
+    } else if (workerCategory.includes(term)) {
+      score += 2;
+      why.add(`category matches "${term}"`);
+    }
+  }
+
+  if (score > 0) {
+    for (const reason of routingReasons.slice(0, 2)) {
+      why.add(reason);
+    }
+  }
+
+  return { score, why: [...why].slice(0, 4) };
+}
+
+function rankWorkerCatalog(
+  workers: WorkerCatalogEntry[],
+  query: string,
+  filePaths: string[] = [],
+  category?: string
+): { worker: WorkerCatalogEntry; score: number; why: string[] }[] {
+  const routing = inferWorkerRoutingTerms(query, filePaths);
+  const terms = [
+    ...tokenizeForWorkerSearch(query),
+    ...routing.terms,
+    ...(category ? [category.toLowerCase()] : []),
+  ];
+
+  return workers
+    .map((worker) => {
+      const scored = scoreWorker(worker, terms, routing.reasons, category);
+      return { worker, ...scored };
+    })
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      return a.worker.persona_id.localeCompare(b.worker.persona_id);
+    });
+}
+
+function suggestWorkerCandidates(
+  workers: WorkerCatalogEntry[],
+  query: string,
+  filePaths: string[],
+  category: string | undefined,
+  topK: number
+): {
+  persona_id: string;
+  name: string;
+  category: string;
+  description: string;
+  score: number;
+  why: string[];
+}[] {
+  const scoped = category
+    ? workers.filter((w) => w.category.toLowerCase() === category.toLowerCase())
+    : workers;
+  const ranked = rankWorkerCatalog(scoped, query, filePaths, category);
+  const positives = ranked.filter((w) => w.score > 0);
+  const selected = (positives.length > 0 ? positives : ranked).slice(0, topK);
+
+  return selected.map(({ worker, score, why }) => ({
+    persona_id: worker.persona_id,
+    name: worker.name,
+    category: worker.category,
+    description: worker.description,
+    score,
+    why:
+      why.length > 0
+        ? why
+        : ["fallback candidate; no strong catalog match found"],
+  }));
 }
 
 export default AgentLoopPlugin;
@@ -1631,12 +2640,16 @@ function computeBoulderHash(state: BoulderState): string {
     status: state.status,
     iteration: state.iteration,
     current_task: state.current_task,
+    in_progress_count: Object.values(state.task_sessions).filter(
+      (t) => t.status === "in-progress"
+    ).length,
     task_sessions: Object.values(state.task_sessions)
       .map((t) => ({
         key: t.task_key,
         status: t.status,
         attempts: t.attempts,
         completed_at: t.completed_at || null,
+        started_at: t.started_at || null,
       }))
       .sort((a, b) => a.key.localeCompare(b.key)),
   };

@@ -23,10 +23,19 @@ import type {
 // Worker Prompt — What each subagent receives
 // ---------------------------------------------------------------------------
 
+export interface PersonaInjection {
+  persona_id: string;
+  persona_name: string;
+  persona_body: string;
+}
+
 /**
  * Constructs the minimal prompt for a worker subagent.
  *
  * The worker prompt contains:
+ * 0. (Optional) Persona prefix — agency-agent body injected as the worker's
+ *    expert identity. The worker is always dispatched to `agent-loop-worker`;
+ *    the persona changes only the prompt, not the OpenCode subagent ID.
  * 1. System role + constraints
  * 2. The specific task description
  * 3. Relevant notepad entries (learnings, decisions)
@@ -40,12 +49,31 @@ import type {
  * - Previous conversation history
  * - Other workers' full handoff files
  */
-export function buildWorkerPrompt(payload: WorkerPayload): string {
+export function buildWorkerPrompt(
+  payload: WorkerPayload,
+  persona?: PersonaInjection | null
+): string {
   const sections: string[] = [];
   const isAgentTestTask =
     payload.task.title.startsWith("Test Route:") ||
     payload.task.title.startsWith("Review Route:") ||
     payload.task.title === "Generate MonkeyTest Final Report";
+
+  // -- Persona prefix (only when explicitly requested by the orchestrator)
+  if (persona && persona.persona_body.trim()) {
+    sections.push(`# Persona: ${persona.persona_name}
+
+(persona_id: \`${persona.persona_id}\`)
+
+You are operating in the persona below for THIS task only. Use its expertise,
+tone, and standards while still obeying the task constraints in the next
+section. The handoff format requirements at the end are non-negotiable.
+
+---
+${persona.persona_body.trim()}
+---
+`);
+  }
 
   // -- System preamble
   sections.push(`# Task Assignment
@@ -204,6 +232,215 @@ HANDOFF_END
 }
 
 // ---------------------------------------------------------------------------
+// Plan Architect Prompt — dispatched to agent-loop-plan-architect subagent
+// ---------------------------------------------------------------------------
+
+export interface PlanArchitectPayload {
+  plan_path: string;
+  plan_name: string;
+  objective: string;
+  revision: number;
+  prior_plan_content: string; // empty on revision 1
+  accumulated_feedback: string; // empty on revision 1
+  accumulated_clarifications: string; // empty until first CLARIFY_REQUEST round
+}
+
+/**
+ * Builds the prompt for the plan-architect subagent.
+ *
+ * On revision 1 it asks for a fresh multi-perspective decomposition.
+ * On revision ≥2 it must address prior feedback and bump the revision number.
+ */
+export function buildPlanArchitectPrompt(p: PlanArchitectPayload): string {
+  const isRevision = p.revision > 1;
+  const sections: string[] = [];
+
+  sections.push(`# Plan Authoring Assignment
+
+You are the plan-architect. Produce ${isRevision ? "REVISION " + p.revision : "the initial draft"} of the plan file at:
+
+  \`${p.plan_path}\`
+
+This file will be reviewed by the human user before any execution starts. They WILL read it. Make it good.
+
+## Objective
+${p.objective}
+
+## Ask First, Write Second — Clarification Protocol
+
+Before writing the plan, identify EVERY load-bearing decision you cannot make confidently from the objective alone. Typical examples:
+
+- Scope boundaries: which modules / surfaces are in vs out?
+- Tech-stack selection: ORM? testing framework? CI runner? — only the user knows what's already in the repo if you can't tell.
+- Performance / SLO targets: "fast" is ambiguous; ask for concrete numbers when load matters.
+- UX preferences: dark mode? mobile-first? a11y target? — never guess.
+- Risk tolerance: is downtime / migration acceptable? are public-API breaking changes ok?
+- Acceptance bar: how tested? how documented? what does "done" look like?
+
+Rule: **if more than ~30% of your TODOs would change depending on an unknown answer, you MUST ask first**.
+
+How to ask, in order of preference:
+
+**1. PREFERRED — call the \`Question\` tool directly** (note capital \`Q\`). The runtime permits this. The user sees a structured multiple-choice UI and answers come back to YOU in this same dispatch.
+
+Exact call schema:
+
+\`\`\`typescript
+Question({
+  questions: [{
+    question: "Which IDP do you want new-api to authenticate against?",
+    header: "SSO direction",
+    options: [
+      { label: "Existing org IDP (Casdoor / Keycloak / Okta / Azure AD)", description: "Configure new-api as OIDC Relying Party against your IdP." },
+      { label: "lobsterpool SP-style SSO", description: "Reuse lobsterpool's session for new-api." },
+      { label: "Add SAML / CAS protocol support", description: "Extend new-api to a protocol it doesn't currently speak." },
+      { label: "Other / Custom", description: "I'll describe my scenario." }
+    ]
+  }, {
+    question: "Deployment environment?",
+    header: "Target",
+    options: [
+      { label: "Production", description: "Plan must respect prod constraints." },
+      { label: "Local dev", description: "Free to iterate." }
+    ]
+  }]
+})
+\`\`\`
+
+Rules for the \`Question\` tool:
+- Up to 5 questions per call. Pass them all in one \`questions\` array.
+- Every \`options[]\` entry needs both \`label\` AND \`description\`.
+- Always include an \`Other\` / \`Custom\` option for free-text fallback.
+- Do NOT echo the questions as markdown after invoking — the tool itself surfaces them.
+- After receiving answers, fold them into your reasoning and proceed (write the plan or ask follow-ups).
+
+**2. FALLBACK — emit a \`CLARIFY_REQUEST\` block**. Use this only when you need answers persisted to disk for cross-session continuity (rare). Format:
+
+\`\`\`
+CLARIFY_REQUEST
+plan_path: ${p.plan_path}
+revision: ${p.revision}
+
+## Why I cannot write the plan yet
+(2–3 sentences)
+
+## Questions
+1. <question, single concrete decision>
+2. <question, single concrete decision>
+   ...
+
+(Cap at 5. Multiple-choice phrasing. No yes/no taste questions.)
+\`\`\`
+
+Do NOT write the plan file in the same response as a \`CLARIFY_REQUEST\`. Pick ONE: \`Question\` tool, \`CLARIFY_REQUEST\` block, or \`PLAN_WRITTEN\`.
+
+When clarifications are already provided in this prompt (see "Accumulated Clarifications" below), you must NOT re-ask the same question — the user already answered it.
+
+## Required Reasoning Discipline
+Do all four phases internally before writing:
+1. Initial Understanding — restate the objective, list assumptions, list unknowns.
+2. Multi-Perspective Exploration — three substantively different decompositions:
+   - fastest-delivery
+   - risk-reduction-first
+   - architectural-cleanliness-first
+   Each MUST diverge in ordering and cut points, not just wording.
+3. Critic Review — fresh-eyes comparison; you may synthesize across the three rather than picking one.
+4. Final Plan — emit the chosen decomposition as TODOs.
+
+Surface 2–6 sentences from each phase under \`## Plan Rationale\`.
+
+## File Format
+Write exactly one file at the path above. Frontmatter:
+\`\`\`
+---
+plan_name: ${p.plan_name}
+revision: ${p.revision}
+created_at: "<ISO timestamp>"
+---
+\`\`\`
+Do NOT include \`approved_at\` — the runtime owns that field.
+
+Sections in order: TL;DR, Context, Work Objectives, Plan Rationale, Verification Strategy, TODOs.
+
+TODO formatting (REQUIRED):
+\`\`\`
+- [ ] N. Title
+
+  **Task Type**: spike | impl | verify   (one word)
+  **Acceptance Criteria**: ...
+  **Must NOT do**: ...
+  **References**: ...
+  **Depends on**: todo:K   (omit if none)
+  **Parallel Group**: optional name like "table-impls" — co-tagged TODOs are explicitly safe to run concurrently
+  free-form description...
+\`\`\`
+
+Constraints:
+- 3–12 TODOs.
+- Each TODO is doable by ONE worker in one dispatch (≤ ~20 minutes).
+- Acceptance criteria must be observable, not aspirational.
+- Use \`todo:N\` keys in dependencies, never titles.
+- Use **spike** for upfront research/analysis tasks that produce a shared note used by later tasks. Use **impl** for actual changes. Use **verify** for final acceptance.
+- When several TODOs share a common dependency and touch independent files, give them the SAME \`Parallel Group\` so the orchestrator dispatches them concurrently. The runtime's gate is deferred across the batch — don't worry about \`pnpm build\` thrashing.
+- Bias the design toward fan-out: a single upfront spike followed by a wide parallel impl batch is preferable to a long serial chain when the impls are independent.
+`);
+
+  if (isRevision) {
+    sections.push(`## Prior Plan (revision ${p.revision - 1})
+
+You MUST read and replace this. Output the FULL revised plan, do not produce a diff.
+
+\`\`\`markdown
+${p.prior_plan_content.trim() || "(missing prior plan)"}
+\`\`\`
+
+## Accumulated User Feedback
+Address every point. Add a \`## Revision Notes\` section listing each feedback item and your response.
+
+${p.accumulated_feedback.trim() || "(no feedback recorded)"}
+`);
+  }
+
+  if (p.accumulated_clarifications.trim()) {
+    sections.push(`## Accumulated Clarifications (already answered by user)
+
+These Q/A pairs are settled. Do NOT re-ask. Bake the answers into the plan and reference the relevant decisions in \`## Plan Rationale\`.
+
+${p.accumulated_clarifications.trim()}
+`);
+  }
+
+  sections.push(`## Final Output Contract
+
+Choose ONE final mode:
+
+**Path A — call \`Question\` tool now**: invoke \`Question({...})\` mid-dispatch. Answers come back to YOU in this same task; continue reasoning and either write the plan (Path C) or ask more questions. This is preferred for short interactive interviews.
+
+**Path B — emit \`CLARIFY_REQUEST\`**: end the dispatch with a \`CLARIFY_REQUEST\` block. Used when answers must be persisted across sessions or you want them recorded into \`{plan_name}.clarifications.md\` for later revisions.
+
+**Path C — write the plan and emit \`PLAN_WRITTEN\`**: write the plan file then return ONLY this short message as your final response (no extra prose):
+
+\`\`\`
+PLAN_WRITTEN
+path: ${p.plan_path}
+revision: ${p.revision}
+todo_count: <N>
+\`\`\`
+
+Pick exactly one terminal mode per dispatch. Path A may loop multiple Question calls before transitioning to Path C.
+
+The orchestrator handles each terminal:
+- Path C → orchestrator calls \`agent_loop_init\` (auto-approve by default).
+- Path B → orchestrator surfaces questions to user via \`Question\` tool and calls \`agent_loop_record_clarifications\`.
+- Path A → no orchestrator action needed; you handled it inline.
+
+Revision does NOT bump for Question / CLARIFY rounds — only when the user explicitly edits/regenerates an existing draft.
+`);
+
+  return sections.join("\n");
+}
+
+// ---------------------------------------------------------------------------
 // Continuation Prompt — Injected into orchestrator after worker returns
 // ---------------------------------------------------------------------------
 
@@ -249,11 +486,30 @@ export function buildContinuationPrompt(ctx: ContinuationContext): string {
     lines.push(``);
   }
 
-  // Next action
-  if (ctx.next_task_key && ctx.next_task_title) {
+  const ready = ctx.ready_tasks ?? [];
+  const inFlight = ctx.in_progress_tasks ?? [];
+
+  if (inFlight.length > 0) {
+    lines.push(`**In-Flight (${inFlight.length})**:`);
+    for (const t of inFlight) lines.push(`  - \`${t.task_key}\`: ${t.task_title}`);
+    lines.push(``);
+  }
+
+  if (ready.length > 1) {
+    lines.push(`**Ready to dispatch in PARALLEL (${ready.length})**:`);
+    for (const t of ready) lines.push(`  - \`${t.task_key}\`: ${t.task_title}`);
+    lines.push(``);
+    lines.push(
+      `Call \`agent_loop_pick_batch\`, then dispatch ALL ready tasks IN THE SAME TURN by issuing one Task tool call per task in a single response. After every worker has returned, process each handoff in order.`
+    );
+  } else if (ctx.next_task_key && ctx.next_task_title) {
     lines.push(`**Next Task**: ${ctx.next_task_title} (\`${ctx.next_task_key}\`)`);
     lines.push(``);
     lines.push(`Dispatch the next worker for \`${ctx.next_task_key}\` now.`);
+  } else if (inFlight.length > 0) {
+    lines.push(
+      `Nothing new is ready. ${inFlight.length} worker(s) still in flight; wait for their handoffs.`
+    );
   } else {
     lines.push(`**All tasks completed.** Generate the completion report.`);
   }
@@ -329,7 +585,7 @@ You are a loop orchestrator managing a multi-step plan through subagent delegati
 ## Your Role
 1. Read the plan from \`.agent-loop/plans/\`
 2. Read current state from \`.agent-loop/loops/{loop_id}/boulder.json\`
-3. Discover available worker personas with \`agent_loop_list_workers\` when needed
+3. Discover task-specific worker personas with \`agent_loop_suggest_workers\` when needed
 4. For each task in order, dispatch a worker subagent using the Task tool
 5. After each worker returns, process the handoff, run the backpressure gate, and update state
 6. Continue until all tasks are complete or the loop is halted
@@ -346,7 +602,7 @@ The active loop is tracked by \`.agent-loop/active-loop.json\`.
 - NEVER do the implementation work yourself. Always delegate to a worker subagent.
 - NEVER use the TodoWrite tool. Task tracking is handled by boulder.json. Using TodoWrite causes system-reminder pollution that leaks the full task list into every worker's context.
 - Give each worker ONLY what they need: task description + notepad learnings + previous handoff context.
-- Use \`agent_loop_list_workers\` to inspect hidden worker personas available to you. These are for orchestrator selection only; they are not user-facing.
+- Use \`agent_loop_suggest_workers\` to get a small task-specific persona shortlist. Use \`agent_loop_list_workers(category|search)\` only for manual browsing; its default response is intentionally summarized.
 - After each worker returns, use the \`agent_loop_process_handoff\` tool to update state.
 - Use the \`agent_loop_backpressure_gate\` tool to verify quality after each task.
 - If \`agent_loop_status.runtime.pending_save_progress\` is true, stop dispatching in this session and continue from a fresh session via \`agent_loop_resume\`.
@@ -357,6 +613,7 @@ The active loop is tracked by \`.agent-loop/active-loop.json\`.
 When dispatching a worker, use the Task tool with this structure:
 - Agent: choose the most appropriate available worker subagent for the task
 - Prompt: Constructed by the \`agent_loop_dispatch\` tool
+- The dispatch tool returns \`task_prompt\`, not the full worker prompt by default. Pass \`task_prompt\` verbatim to the Task tool; the worker reads the full assignment from \`prompt_path\`.
 
 ## Completion
 When all tasks are done:

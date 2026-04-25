@@ -9,9 +9,9 @@
 // An active-loop.json pointer tracks the currently active loop on disk.
 // =============================================================================
 
-import { readFile, writeFile, mkdir, readdir, rename, unlink } from "fs/promises";
+import { readFile, writeFile, mkdir, readdir, rename, unlink, stat } from "fs/promises";
 import { existsSync } from "fs";
-import { join, basename } from "path";
+import { join, basename, relative } from "path";
 import type {
   BoulderState,
   TaskSession,
@@ -75,6 +75,10 @@ export function notepadsDir(workdir: string, loopId: string): string {
 
 export function evidenceDir(workdir: string, loopId: string): string {
   return join(loopInstanceDir(workdir, loopId), "evidence");
+}
+
+export function workerPromptsDir(workdir: string, loopId: string): string {
+  return join(loopInstanceDir(workdir, loopId), "worker-prompts");
 }
 
 export function runtimeStatePath(workdir: string, loopId: string): string {
@@ -459,7 +463,13 @@ export function computeStats(state: BoulderState): LoopStats {
   };
 }
 
-/** Mark a task as in-progress */
+/**
+ * Mark a task as in-progress. Multi-task safe: `state.current_task` is
+ * preserved as a "primary" pointer (back-compat for compaction context and
+ * UIs), but the source of truth for which tasks are running is
+ * `task_sessions[k].status === "in-progress"`. We only assign current_task if
+ * nothing else is currently primary.
+ */
 export function markTaskStarted(
   state: BoulderState,
   taskKey: string,
@@ -471,8 +481,19 @@ export function markTaskStarted(
   t.attempts += 1;
   t.started_at = new Date().toISOString();
   if (workerSessionId) t.worker_session_id = workerSessionId;
-  state.current_task = taskKey;
+  if (!state.current_task) state.current_task = taskKey;
   state.iteration += 1;
+}
+
+/**
+ * If a terminal transition removed the "primary" current_task pointer,
+ * promote any remaining in-progress task as the new primary so compaction
+ * context and legacy UIs still show something meaningful.
+ */
+function reassignPrimaryCurrent(state: BoulderState, vacatedKey: string): void {
+  if (state.current_task !== vacatedKey) return;
+  const stillRunning = inProgressTaskKeys(state);
+  state.current_task = stillRunning[0] ?? null;
 }
 
 /** Mark task as done */
@@ -482,9 +503,7 @@ export function markTaskDone(state: BoulderState, taskKey: string): void {
   t.status = "done";
   t.completed_at = new Date().toISOString();
   state.consecutive_failures = 0;
-  if (state.current_task === taskKey) {
-    state.current_task = null;
-  }
+  reassignPrimaryCurrent(state, taskKey);
 }
 
 /** Mark task as failed */
@@ -504,9 +523,7 @@ export function markTaskFailed(
     t.status = "failed"; // eligible for retry
   }
 
-  if (state.current_task === taskKey) {
-    state.current_task = null;
-  }
+  reassignPrimaryCurrent(state, taskKey);
 }
 
 /** Mark task as blocked immediately */
@@ -524,26 +541,58 @@ export function markTaskBlocked(
   }
   state.consecutive_failures += 1;
 
-  if (state.current_task === taskKey) {
-    state.current_task = null;
-  }
+  reassignPrimaryCurrent(state, taskKey);
 }
 
-/** Pick the next actionable task. Respects dependencies. */
-export function pickNextTask(state: BoulderState): string | null {
-  // First: retry failed tasks (not blocked)
+/**
+ * Compare two task keys ("todo:1" < "todo:2" < ... < "todo:10") by index.
+ * String compare alone gets wrong order at 10+.
+ */
+function compareTaskKeys(a: string, b: string): number {
+  const na = parseInt(a.replace(/^todo:/, ""), 10);
+  const nb = parseInt(b.replace(/^todo:/, ""), 10);
+  if (Number.isFinite(na) && Number.isFinite(nb)) return na - nb;
+  return a.localeCompare(b);
+}
+
+/**
+ * Return ALL ready task keys (deps satisfied, status pending or retryable
+ * failed). Sorted by todo index. The orchestrator can dispatch them in
+ * parallel.
+ */
+export function pickReadyTasks(
+  state: BoulderState,
+  max?: number
+): string[] {
+  const ready: string[] = [];
+  // Retryable failures first (so retries get scheduled before fresh tasks)
   for (const [key, t] of Object.entries(state.task_sessions)) {
     if (t.status === "failed" && t.attempts < t.max_attempts) {
-      if (areDependenciesMet(state, key)) return key;
+      if (areDependenciesMet(state, key)) ready.push(key);
     }
   }
-  // Then: pick pending
   for (const [key, t] of Object.entries(state.task_sessions)) {
     if (t.status === "pending") {
-      if (areDependenciesMet(state, key)) return key;
+      if (areDependenciesMet(state, key)) ready.push(key);
     }
   }
-  return null;
+  ready.sort(compareTaskKeys);
+  if (typeof max === "number" && max > 0) return ready.slice(0, max);
+  return ready;
+}
+
+/** Backwards-compatible single-task picker. */
+export function pickNextTask(state: BoulderState): string | null {
+  const ready = pickReadyTasks(state, 1);
+  return ready[0] ?? null;
+}
+
+/** Tasks currently in flight (status === "in-progress"). */
+export function inProgressTaskKeys(state: BoulderState): string[] {
+  return Object.entries(state.task_sessions)
+    .filter(([, t]) => t.status === "in-progress")
+    .map(([key]) => key)
+    .sort(compareTaskKeys);
 }
 
 function areDependenciesMet(state: BoulderState, taskKey: string): boolean {
@@ -601,6 +650,152 @@ export async function parsePlan(planPath: string): Promise<Plan> {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Plan frontmatter — approval gate
+// ---------------------------------------------------------------------------
+
+export interface PlanFrontmatter {
+  plan_name?: string;
+  revision?: number;
+  created_at?: string;
+  approved_at?: string;
+}
+
+export function parsePlanFrontmatter(raw: string): {
+  fm: PlanFrontmatter;
+  body: string;
+  rawFrontmatter: string;
+} {
+  const m = raw.match(/^---\n([\s\S]*?)\n---\n?/);
+  if (!m) return { fm: {}, body: raw, rawFrontmatter: "" };
+
+  const block = m[1];
+  const fm: PlanFrontmatter = {};
+  const planName = block.match(/^plan_name:\s*(.+)$/m)?.[1]?.trim();
+  const revision = block.match(/^revision:\s*(\d+)/m)?.[1];
+  const createdAt = block.match(/^created_at:\s*"?([^"\n]+)"?/m)?.[1]?.trim();
+  const approvedAt = block.match(/^approved_at:\s*"?([^"\n]+)"?/m)?.[1]?.trim();
+  if (planName) fm.plan_name = planName;
+  if (revision) fm.revision = parseInt(revision, 10);
+  if (createdAt) fm.created_at = createdAt;
+  if (approvedAt) fm.approved_at = approvedAt;
+
+  return {
+    fm,
+    body: raw.slice(m[0].length),
+    rawFrontmatter: block,
+  };
+}
+
+export async function readPlanFrontmatter(
+  planPath: string
+): Promise<PlanFrontmatter> {
+  if (!existsSync(planPath)) return {};
+  const raw = await readFile(planPath, "utf-8");
+  return parsePlanFrontmatter(raw).fm;
+}
+
+/**
+ * Stamp the plan file with `approved_at`. Idempotent: if already approved,
+ * preserves the original timestamp. Returns the timestamp written.
+ */
+export async function stampPlanApproved(
+  planPath: string
+): Promise<{ approved_at: string; revision: number }> {
+  const raw = await readFile(planPath, "utf-8");
+  const { fm, body } = parsePlanFrontmatter(raw);
+
+  if (fm.approved_at) {
+    return {
+      approved_at: fm.approved_at,
+      revision: fm.revision ?? 1,
+    };
+  }
+
+  const approvedAt = new Date().toISOString();
+  const revision = fm.revision ?? 1;
+
+  // Reconstruct frontmatter, preserving order: plan_name, revision, created_at, approved_at
+  const lines: string[] = ["---"];
+  if (fm.plan_name) lines.push(`plan_name: ${fm.plan_name}`);
+  lines.push(`revision: ${revision}`);
+  if (fm.created_at) lines.push(`created_at: "${fm.created_at}"`);
+  lines.push(`approved_at: "${approvedAt}"`);
+  lines.push("---");
+  lines.push("");
+
+  const next = lines.join("\n") + body.replace(/^\n+/, "");
+  await writeFile(planPath, next, "utf-8");
+  return { approved_at: approvedAt, revision };
+}
+
+/**
+ * Append a round of user feedback for the plan-architect to consume on the
+ * next revision. Stored alongside the plan as `{name}.feedback.md`.
+ */
+export async function appendPlanFeedback(
+  planPath: string,
+  feedback: string,
+  decision: "edit" | "regenerate"
+): Promise<string> {
+  const feedbackPath = planPath.replace(/\.md$/, ".feedback.md");
+  const existing = existsSync(feedbackPath)
+    ? await readFile(feedbackPath, "utf-8")
+    : "";
+  const ts = new Date().toISOString();
+  const block = `\n\n### [${ts}] decision=${decision}\n${feedback.trim()}\n`;
+  await writeFile(feedbackPath, (existing + block).trimStart() + "\n", "utf-8");
+  return feedbackPath;
+}
+
+export async function readPlanFeedback(planPath: string): Promise<string> {
+  const feedbackPath = planPath.replace(/\.md$/, ".feedback.md");
+  if (!existsSync(feedbackPath)) return "";
+  return readFile(feedbackPath, "utf-8");
+}
+
+export async function readPlanContent(planPath: string): Promise<string> {
+  if (!existsSync(planPath)) return "";
+  return readFile(planPath, "utf-8");
+}
+
+/**
+ * Append a round of question/answer pairs from the user, in response to the
+ * architect's CLARIFY_REQUEST. Stored alongside the plan as
+ * `{name}.clarifications.md`. The next architect dispatch reads this file
+ * and reasons over it before producing the plan.
+ */
+export interface ClarificationPair {
+  question: string;
+  answer: string;
+}
+
+export async function appendPlanClarifications(
+  planPath: string,
+  pairs: ClarificationPair[]
+): Promise<string> {
+  const clarPath = planPath.replace(/\.md$/, ".clarifications.md");
+  const existing = existsSync(clarPath) ? await readFile(clarPath, "utf-8") : "";
+  const ts = new Date().toISOString();
+  const block = [
+    "",
+    "",
+    `### [${ts}] clarification round`,
+    ...pairs.flatMap((p, i) => [
+      `${i + 1}. **Q**: ${p.question.trim()}`,
+      `   **A**: ${p.answer.trim()}`,
+    ]),
+  ].join("\n");
+  await writeFile(clarPath, (existing + block).trimStart() + "\n", "utf-8");
+  return clarPath;
+}
+
+export async function readPlanClarifications(planPath: string): Promise<string> {
+  const clarPath = planPath.replace(/\.md$/, ".clarifications.md");
+  if (!existsSync(clarPath)) return "";
+  return readFile(clarPath, "utf-8");
+}
+
 function extractSection(md: string, heading: string): string {
   // Match ## Heading or ### Heading
   const regex = new RegExp(
@@ -653,15 +848,23 @@ export function parseTodos(planContent: string): PlanTask[] {
     const start = rawTodos[i].bodyStart;
     const end = i + 1 < rawTodos.length ? rawTodos[i + 1].lineStart : todoSection.length;
     const body = todoSection.slice(start, end).trim();
+    const acceptanceCriteria = extractBoldSection(body, "Acceptance Criteria");
+    const references = extractBoldSection(body, "References");
+    const mustNotDo = extractBoldSection(body, "Must NOT do");
 
     const task: PlanTask = {
       index: rawTodos[i].index,
       key: `todo:${rawTodos[i].index}`,
       title: rawTodos[i].title,
       description: body || rawTodos[i].title,
-      acceptance_criteria: extractBoldSection(body, "Acceptance Criteria"),
-      references: extractBoldSection(body, "References"),
-      must_not_do: extractBoldSection(body, "Must NOT do"),
+      task_type: parseTaskType(body),
+      parallel_group: parseParallelGroup(body),
+      file_paths: extractPlanFilePaths(
+        `${rawTodos[i].title}\n${body}\n${acceptanceCriteria}\n${references}\n${mustNotDo}`
+      ),
+      acceptance_criteria: acceptanceCriteria,
+      references,
+      must_not_do: mustNotDo,
       dependencies: parseDependencies(body),
     };
     tasks.push(task);
@@ -674,6 +877,48 @@ function extractBoldSection(body: string, label: string): string {
   const regex = new RegExp(`\\*\\*${escapeRegex(label)}\\*\\*:\\s*(.+?)(?=\\n\\s*\\*\\*|$)`, "s");
   const m = regex.exec(body);
   return m ? m[1].trim() : "";
+}
+
+function parseTaskType(body: string): PlanTask["task_type"] {
+  const raw = extractBoldSection(body, "Task Type")
+    .replace(/[`*_]/g, "")
+    .trim()
+    .toLowerCase();
+  if (!raw) return undefined;
+
+  const values = raw.match(/\b(spike|impl|verify)\b/g) || [];
+  const unique = [...new Set(values)];
+  return unique.length === 1 ? (unique[0] as PlanTask["task_type"]) : undefined;
+}
+
+function parseParallelGroup(body: string): string | null {
+  const raw = extractBoldSection(body, "Parallel Group")
+    .split("\n")[0]
+    .replace(/[`*_]/g, "")
+    .trim();
+  if (!raw) return null;
+  if (/^(none|n\/a|na|null|optional|tbd|-)\b/i.test(raw)) return null;
+  return raw;
+}
+
+function extractPlanFilePaths(text: string): string[] {
+  const patterns = [
+    /`([a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+)`/g,
+    /`([a-zA-Z0-9_\-./]+\/[a-zA-Z0-9_\-./]*)`/g,
+    /(?:^|[\s(])((?:\.\/)?(?:src|lib|app|test|tests|pkg|web|server|client|api|components|\.opencode|bin)\/[a-zA-Z0-9_\-./]+(?:\.[a-zA-Z0-9]+)?)/g,
+  ];
+
+  const paths = new Set<string>();
+  for (const pattern of patterns) {
+    let m: RegExpExecArray | null;
+    while ((m = pattern.exec(text)) !== null) {
+      let p = (m[1] || m[0]).trim();
+      if (p.startsWith("./")) p = p.slice(2);
+      if (!p.includes("/") || p.startsWith("http") || p.startsWith("//")) continue;
+      paths.add(p.replace(/\/+$/, ""));
+    }
+  }
+  return [...paths];
 }
 
 function parseDependencies(body: string): string[] | undefined {
@@ -734,6 +979,23 @@ ${handoff.next_task_context}
   return filePath;
 }
 
+export async function writeWorkerPrompt(
+  workdir: string,
+  loopId: string,
+  taskKey: string,
+  prompt: string
+): Promise<{ absolute_path: string; relative_path: string }> {
+  const dir = workerPromptsDir(workdir, loopId);
+  await ensureDir(dir);
+  const safeTaskKey = taskKey.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  const filePath = join(dir, `${safeTaskKey}-prompt.md`);
+  await writeFile(filePath, prompt, "utf-8");
+  return {
+    absolute_path: filePath,
+    relative_path: relative(workdir, filePath),
+  };
+}
+
 export async function readHandoff(
   workdir: string,
   loopId: string,
@@ -758,15 +1020,29 @@ export async function readLatestHandoff(
 
   if (files.length === 0) return null;
 
-  files.sort((a, b) => {
-    const numA = parseInt((a.match(/todo-(\d+)-handoff\.md$/)?.[1] || "0"), 10);
-    const numB = parseInt((b.match(/todo-(\d+)-handoff\.md$/)?.[1] || "0"), 10);
-    return numA - numB;
+  const ranked: { file: string; parsed: HandoffFile; timestamp: number }[] = [];
+  for (const file of files) {
+    const filePath = join(dir, file);
+    const raw = await readFile(filePath, "utf-8");
+    const parsed = parseHandoff(raw);
+    let timestamp = Date.parse(parsed.meta.completed_at);
+    if (!Number.isFinite(timestamp)) {
+      try {
+        timestamp = (await stat(filePath)).mtimeMs;
+      } catch {
+        timestamp = 0;
+      }
+    }
+    ranked.push({ file, parsed, timestamp });
+  }
+
+  ranked.sort((a, b) => {
+    const byTime = a.timestamp - b.timestamp;
+    if (byTime !== 0) return byTime;
+    return compareTaskKeys(a.parsed.meta.task_key, b.parsed.meta.task_key);
   });
 
-  const latest = files[files.length - 1];
-  const raw = await readFile(join(dir, latest), "utf-8");
-  return parseHandoff(raw);
+  return ranked[ranked.length - 1]?.parsed ?? null;
 }
 
 function parseHandoff(raw: string): HandoffFile {

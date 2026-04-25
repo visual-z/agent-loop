@@ -164,6 +164,7 @@ const legacyAgentFiles = ["monkey-test.md"];
 const agentFiles = [
   "agent-loop-orchestrator.md",
   "agent-loop-worker.md",
+  "agent-loop-plan-architect.md",
   "agent-test-orchestrator.md",
   "agent-test-worker.md",
   "monkey-test-page-tester.md",
