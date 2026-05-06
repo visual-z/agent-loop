@@ -1,0 +1,38 @@
+{
+  "name": "agent-loop",
+  "version": "0.1.0",
+  "description": "Codex-native Agent Loop workflow: run long tasks through subagents, filesystem state, handoffs, verification, and hook continuation.",
+  "author": {
+    "name": "visual"
+  },
+  "homepage": "https://github.com/visual-z/agent-loop",
+  "repository": "https://github.com/visual-z/agent-loop",
+  "license": "MIT",
+  "keywords": [
+    "agent-loop",
+    "codex",
+    "skills",
+    "subagents",
+    "workflow",
+    "hooks"
+  ],
+  "skills": "./skills/",
+  "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "Agent Loop",
+    "shortDescription": "Filesystem-backed subagent workflow for long Codex tasks",
+    "longDescription": "Agent Loop turns a long objective into a visible plan, delegates task execution to subagents, stores state and handoffs in the workspace, and uses hooks to continue active work without an external loop.",
+    "developerName": "visual",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use Agent Loop to plan and run this long task"
+    ],
+    "brandColor": "#111827",
+    "screenshots": []
+  }
+}

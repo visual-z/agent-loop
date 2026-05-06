@@ -1,0 +1,13 @@
+{
+  "name": "@agent-loop/codex-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Codex-native Agent Loop plugin: skill-first subagent workflow with filesystem state and hook continuation.",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
